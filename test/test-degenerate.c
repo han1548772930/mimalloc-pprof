@@ -300,7 +300,7 @@ static void test_huge_churn(void) {
 static void test_degenerate_arguments(void) {
   /* zero-size: must return either NULL or a uniquely freeable pointer, never crash */
   void* z = mi_malloc(0);
-  if (z != NULL) { assert(mi_usable_size(z) >= 0); mi_free(z); }
+  if (z != NULL) { const size_t zs = mi_usable_size(z); assert(zs < ((size_t)1 << 20)); (void)zs; mi_free(z); }
 
   /* free(NULL) is a no-op */
   mi_free(NULL);
@@ -314,14 +314,17 @@ static void test_degenerate_arguments(void) {
     mi_free(p);
   }
 
-  /* absurd sizes must fail cleanly (NULL), not abort or wrap around */
-  void* huge = mi_malloc(SIZE_MAX);
+  /* absurd sizes must fail cleanly (NULL), not abort or wrap around. `volatile` keeps the
+     sizes opaque to the compiler: GCC's -Walloc-size-larger-than would otherwise reject the
+     deliberately oversized constants at compile time under -Werror (#373). */
+  volatile size_t size_max = SIZE_MAX;
+  void* huge = mi_malloc(size_max);
   assert(huge == NULL);
-  void* huge2 = mi_malloc(SIZE_MAX / 2);
+  void* huge2 = mi_malloc(size_max / 2);
   if (huge2 != NULL) { mi_free(huge2); }   /* allowed to succeed on paper; must not corrupt */
 
   /* calloc overflow must be detected rather than silently under-allocating */
-  void* ov = mi_calloc(SIZE_MAX / 2, 4);
+  void* ov = mi_calloc(size_max / 2, 4);
   assert(ov == NULL);
 
   printf("  degenerate args: zero-size, NULL free, alignments, overflow all handled\n");
