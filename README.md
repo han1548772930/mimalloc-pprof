@@ -175,29 +175,29 @@ allocators replay one identical stream inside each paired block.
 
 [![Cross-thread producer/consumer handoff: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-cross-thread.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
 
-[![Larson server workload with rotating block owners: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-larson.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
-
-[![xmalloc-test producer/consumer: aggregate throughput by worker count for all five allocators](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-xmalloc-test.svg)](https://zackees.github.io/mimalloc-pprof/#scaling)
+The Larson and xmalloc-test panels have not yet reached the published
+`benchmark-stats` site. They remain part of the full scaling sweep; see
+[#424](https://github.com/zackees/mimalloc-pprof/issues/424) for the publication
+blocker and the incomplete-run evidence. The four panels above are the ones
+currently available.
 
 ### Deterministic requested-size distributions
 
-These final four scaling graphics use deterministic per-worker playback at 1, 2, 3, 4, 6,
+The pending four scaling graphics use deterministic per-worker playback at 1, 2, 3, 4, 6,
 and 8 workers. They request either exact powers of two from 64 KiB through 4 MiB or an
 unbiased uniformly random byte size over the same inclusive range. Both use the normal
 allocation API; “power-of-two” describes the requested size, not extra pointer alignment.
-Each allocator row shows the empirical P5–P95 area and median from at least 40 paired runs.
+The planned allocator rows show the empirical P5–P95 area and median from at least 40 paired runs.
 Within each metric every row—and both workloads—uses the same zero-based Y-axis domain and
 ticks, rounded upward from the maximum of all raw observations so outliers are not clipped.
 The four primary rows are TCMalloc, jemalloc, Microsoft mimalloc, and mimalloc-pprof; Bun
 mimalloc remains collected in a separately labelled supplemental row.
 
-[![Power-of-two requested sizes: four stacked allocator throughput areas plus supplemental Bun](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
-
-[![Power-of-two requested sizes: four stacked allocator peak RSS areas plus supplemental Bun](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
-
-[![Uniform random requested sizes: four stacked allocator throughput areas plus supplemental Bun](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
-
-[![Uniform random requested sizes: four stacked allocator peak RSS areas plus supplemental Bun](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+The power-of-two and uniformly random requested-size throughput and peak-RSS
+reports are **not published yet**. Full collection has exceeded the existing
+30-minute workflow limit; partial runs are not valid 40-repetition reports.
+Follow [#424](https://github.com/zackees/mimalloc-pprof/issues/424) for the
+complete baseline and source data before interpreting these distributions.
 
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the
