@@ -2742,8 +2742,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   const mi_msecs_t arenas_expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
   if (!visit_all && !force && (arenas_expire == 0 || arenas_expire > now)) return;
 
-  const size_t max_arena = mi_arenas_get_count(subproc);
-  if (max_arena == 0) return;
+  if (mi_arenas_get_count(subproc) == 0) return;
 
   // allow only one thread to purge at a time (todo: allow concurrent purging?)
   //
@@ -2790,9 +2789,11 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   mi_atomic_guard(&mi_arenas_purge_guard)
   {
     ran = true;
+    // Reclaim can shrink the table while we wait for the guard.
+    const size_t max_arena = mi_arenas_get_count(subproc);
     // increase global expire: at most one purge per delay cycle
     if (arenas_expire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now + (delay/10)); }
-    const size_t arena_start = tseq % max_arena;
+    const size_t arena_start = (max_arena == 0 ? 0 : tseq % max_arena);
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
     bool any_purged = false;
