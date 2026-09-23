@@ -275,10 +275,8 @@ static void run_busy_thread_row(void) {
   printf("[A5] a thread inside the allocator forbids the reclaim\n");
   mi_option_set(mi_option_arena_reserve, (long)ARENA_RESERVE_KIB);
   g_stall.heap = mi_heap_new();
-  g_stall.block = big_alloc(BIG_BYTES, 0x5A);          // a page of its own arena, owned by this heap
-  void* p = mi_heap_malloc(g_stall.heap, BIG_BYTES);   // the heap's own page (not the freed one below)
-  MI_UNUSED(p);
-  mi_free(g_stall.block);                              // the arena is empty again, but the page is the heap's
+  g_stall.block = mi_heap_malloc(g_stall.heap, BIG_BYTES);
+  if (g_stall.block == NULL) { check(false, "A5: heap page allocated"); return; }
 
   mi_atomic_store_release(&mi_debug_stall_in_heap_delete_claim, (uintptr_t)1);
   thread_t worker;
@@ -288,6 +286,10 @@ static void run_busy_thread_row(void) {
   const bool stalled = (mi_atomic_load_acquire(&mi_debug_stall_in_heap_delete_claim) == 2);
   check(stalled, "A5: the worker is stalled inside mi_heap_delete (page pinned)");
 
+  // Create the empty candidate after pthread/CreateThread has finished allocating its
+  // runtime state; otherwise that state can occupy and pin the arena under test.
+  void* empty = big_alloc(BIG_BYTES, 0x5A);
+  mi_free(empty);
   const arena_accounting_t before = accounting();
   mi_purge_all_report_t rep2; _mi_memzero(&rep2, sizeof(rep2));
   (void)mi_purge_all_ex((mi_purge_flags_t)(MI_PURGE_FORCE | MI_PURGE_RECLAIM), 0 /* no waiting */, &rep2);
@@ -301,6 +303,8 @@ static void run_busy_thread_row(void) {
   mi_atomic_store_release(&mi_debug_stall_in_heap_delete_claim, (uintptr_t)0);
   const bool joined = thread_join(worker);
   check(joined, "A5: the worker finished its heap delete");
+  mi_free(g_stall.block);  // heap_delete preserves live blocks
+  g_stall.block = NULL;
   const mi_purge_all_report_t rep3 = reclaim_all();
   check(rep3.reclaimed && rep3.arenas_reclaimed >= 1, "A5: with the worker gone the arena IS released");
 }
