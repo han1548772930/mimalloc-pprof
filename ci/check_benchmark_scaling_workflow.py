@@ -37,7 +37,9 @@ SCALING_SOURCE = (
     Path(__file__).resolve().parents[1] / "rust" / "benchmark-suite" / "src" / "scaling.rs"
 )
 JOBS = {
-    "build-and-measure",
+    "build",
+    "measure",
+    "assemble",
     "artifact-audit",
     "publish-branch",
     "package-pages",
@@ -46,6 +48,7 @@ JOBS = {
 }
 # Coverage mode exists to stay cheap; the budget is part of the contract.
 MAXIMUM_BUILD_TIMEOUT_MINUTES = 30
+MEASURE_TIMEOUT_MINUTES = 120  # #424: approved single-host measurement envelope.
 EXPECTED_BLOCKS = 3
 
 
@@ -118,22 +121,34 @@ def validate(workflow: Mapping[str, object]) -> None:
         if job.get("runs-on") != "ubuntu-24.04":
             fail(f"workflow.jobs.{name}.runs-on: expected ubuntu-24.04")
         timeout = job.get("timeout-minutes")
-        if not isinstance(timeout, int) or timeout > MAXIMUM_BUILD_TIMEOUT_MINUTES:
+        limit = MEASURE_TIMEOUT_MINUTES if name == "measure" else MAXIMUM_BUILD_TIMEOUT_MINUTES
+        if not isinstance(timeout, int) or timeout > limit:
             fail(
-                f"workflow.jobs.{name}.timeout-minutes: expected <={MAXIMUM_BUILD_TIMEOUT_MINUTES}"
+                f"workflow.jobs.{name}.timeout-minutes: expected <={limit}"
             )
         if "strategy" in job:
-            fail(f"workflow.jobs.{name}: parallel matrices are forbidden")
+            fail(f"workflow.jobs.{name}: parallel matrices are forbidden; measure on one host")
         steps_by_name(job)
 
-    build = mapping(jobs["build-and-measure"], "build-and-measure")
+    build = mapping(jobs["build"], "build")
     if build.get("timeout-minutes") != MAXIMUM_BUILD_TIMEOUT_MINUTES:
-        fail(f"build-and-measure must enforce the {MAXIMUM_BUILD_TIMEOUT_MINUTES}-minute limit")
-    steps = steps_by_name(build)
-    run_step = mapping(steps.get("run sparse scaling sweep"), "run sparse scaling sweep")
+        fail(f"build must enforce the {MAXIMUM_BUILD_TIMEOUT_MINUTES}-minute limit")
+    measure = mapping(jobs["measure"], "measure")
+    if measure.get("timeout-minutes") != MEASURE_TIMEOUT_MINUTES:
+        fail(f"measure must enforce the {MEASURE_TIMEOUT_MINUTES}-minute limit")
+    build_steps = steps_by_name(build)
+    measure_steps = steps_by_name(measure)
+    assemble = mapping(jobs["assemble"], "assemble")
+    assemble_steps = steps_by_name(assemble)
+    run_step = mapping(measure_steps.get("run sparse scaling sweep"), "run sparse scaling sweep")
     run = run_step.get("run")
     if not isinstance(run, str) or "benchmark-scaling-run" not in run or "--blocks" not in run:
         fail("scaling measurement step must execute benchmark-scaling-run with explicit blocks")
+    for required in ("for SHARD in 0 1 2 3 4 5", '--shard-index "$SHARD"', "--shard-count 6"):
+        if required not in run:
+            fail(f"scaling measurement step is missing {required}")
+    if "cargo run" in run or "soldr" in run:
+        fail("scaling measurement must execute the prebuilt binary directly")
     if " &" in run or "parallel" in run or "xargs" in run:
         fail("scaling allocators must execute sequentially")
     for step_name in (
@@ -141,20 +156,53 @@ def validate(workflow: Mapping[str, object]) -> None:
         "run sparse scaling sweep",
         "compute publication eligibility",
     ):
-        step = mapping(steps.get(step_name), step_name)
+        owner = (
+            build_steps
+            if step_name == "determine run seed"
+            else (measure_steps if step_name == "run sparse scaling sweep" else assemble_steps)
+        )
+        step = mapping(owner.get(step_name), step_name)
         if "${{ inputs." in str(step.get("run", "")):
             fail(f"{step_name}: workflow inputs must enter shell through env, not source text")
-    seed_step = mapping(steps.get("determine run seed"), "determine run seed")
+    seed_step = mapping(build_steps.get("determine run seed"), "determine run seed")
     seed_env = mapping(seed_step.get("env"), "determine run seed.env")
     if "INPUT_RUN_SEED" not in seed_env or "*[!0-9]*" not in str(seed_step.get("run", "")):
         fail("run seed must use an env boundary and strict decimal validation")
-    raw = mapping(steps.get("upload raw scaling artifact"), "upload raw scaling artifact")
+    setup_soldr = next(
+        (
+            step
+            for step in cast(list[object], build["steps"])
+            if "setup-soldr@" in str(mapping(step, "build step").get("uses", ""))
+        ),
+        None,
+    )
+    if setup_soldr is None:
+        fail("build must configure setup-soldr")
+    soldr_with = mapping(mapping(setup_soldr, "setup-soldr").get("with"), "setup-soldr.with")
+    for key, expected in {
+        "cache-preset": "full",
+        "toolchain-file": "rust/rust-toolchain.toml",
+        "lockfile": "rust/Cargo.lock",
+        "target-dir": "rust/target",
+    }.items():
+        if soldr_with.get(key) != expected:
+            fail(f"setup-soldr must set {key} to {expected}")
+    merge_run = mapping(assemble_steps.get("merge scaling shards"), "merge scaling shards").get(
+        "run"
+    )
+    if (
+        not isinstance(merge_run, str)
+        or "benchmark-scaling-merge" not in merge_run
+        or "--report-out" not in merge_run
+    ):
+        fail("assemble must merge scaling shards into one raw run")
+    raw = mapping(measure_steps.get("upload raw scaling shard"), "upload raw scaling shard")
     if raw.get("if") != "always()":
         fail("raw scaling artifact must upload with if: always()")
     raw_with = mapping(raw.get("with"), "upload raw scaling artifact.with")
     if raw_with.get("retention-days") != 30 or raw_with.get("include-hidden-files") is not True:
         fail("raw scaling artifact must retain all bytes for 30 days")
-    eligibility = mapping(steps.get("compute publication eligibility"), "eligibility")
+    eligibility = mapping(assemble_steps.get("compute publication eligibility"), "eligibility")
     eligibility_run = eligibility.get("run")
     if not isinstance(eligibility_run, str):
         fail("eligibility step needs a shell policy")
@@ -287,11 +335,11 @@ def load(path: Path) -> dict[str, object]:
 
 
 def _build_job(workflow: dict[str, Any]) -> dict[str, Any]:
-    return cast(dict[str, Any], cast(dict[str, Any], workflow["jobs"])["build-and-measure"])
+    return cast(dict[str, Any], cast(dict[str, Any], workflow["jobs"])["build"])
 
 
 def _step(workflow: dict[str, Any], name: str, job: str | None = None) -> dict[str, Any]:
-    """A step by name, from `build-and-measure` unless another job is named."""
+    """A step by name, from `build` unless another job is named."""
     steps = (
         cast(list[dict[str, Any]], cast(dict[str, Any], workflow["jobs"])[job]["steps"])
         if job is not None
@@ -325,11 +373,23 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
     "matrix introduced": lambda wf: _build_job(wf).__setitem__(
         "strategy", {"matrix": {"os": ["ubuntu-24.04"]}}
     ),
+    "measure matrix introduced": lambda wf: cast(
+        dict[str, Any], cast(dict[str, Any], wf["jobs"])["measure"]
+    ).__setitem__("strategy", {"matrix": {"shard": [0, 1, 2, 3, 4, 5]}}),
+    "measure shard loop shortened": lambda wf: _step(
+        wf, "run sparse scaling sweep", "measure"
+    ).__setitem__("run", "benchmark-scaling-run --blocks 3 --shard-index 0 --shard-count 6"),
     "unpinned action": lambda wf: cast(list[dict[str, Any]], _build_job(wf)["steps"])[
         0
     ].__setitem__("uses", "actions/checkout@v4"),
-    "allocators run in parallel": lambda wf: _step(wf, "run sparse scaling sweep").__setitem__(
-        "run", "benchmark-scaling-run --blocks 3 &"
+    "setup-soldr cache preset weakened": lambda wf: cast(
+        dict[str, Any], cast(list[dict[str, Any]], _build_job(wf)["steps"])[1]["with"]
+    ).__setitem__("cache-preset", "foundation"),
+    "allocators run in parallel": lambda wf: _step(
+        wf, "run sparse scaling sweep", "measure"
+    ).__setitem__("run", "benchmark-scaling-run --blocks 3 &"),
+    "shard count removed": lambda wf: _step(wf, "run sparse scaling sweep", "measure").__setitem__(
+        "run", "benchmark-scaling-run --blocks 3 --shard-index 0"
     ),
     "input interpolated into shell": lambda wf: _step(wf, "determine run seed").__setitem__(
         "run", "SEED=${{ inputs.run_seed }}"
@@ -337,14 +397,14 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
     "seed validation removed": lambda wf: _step(wf, "determine run seed").__setitem__(
         "run", "echo seed=1 >> $GITHUB_OUTPUT"
     ),
-    "raw artifact conditional": lambda wf: _step(wf, "upload raw scaling artifact").__setitem__(
-        "if", "success()"
-    ),
+    "raw artifact conditional": lambda wf: _step(
+        wf, "upload raw scaling shard", "measure"
+    ).__setitem__("if", "success()"),
     "retention shortened": lambda wf: cast(
-        dict[str, Any], _step(wf, "upload raw scaling artifact")["with"]
+        dict[str, Any], _step(wf, "upload raw scaling shard", "measure")["with"]
     ).__setitem__("retention-days", 1),
     "eligibility accepts any ref": lambda wf: _step(
-        wf, "compute publication eligibility"
+        wf, "compute publication eligibility", "assemble"
     ).__setitem__("run", "echo publish_eligible=true >> $GITHUB_OUTPUT"),
     "blocks default widened": lambda wf: cast(
         dict[str, Any],

@@ -86,7 +86,7 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         value = self.workflow()
         jobs = value["jobs"]
         assert isinstance(jobs, dict)
-        build = jobs["build-and-measure"]
+        build = jobs["build"]
         assert isinstance(build, dict)
         build["timeout-minutes"] = 45
         with self.assertRaisesRegex(policy.ScalingWorkflowError, "30"):
@@ -96,10 +96,31 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         value = self.workflow()
         jobs = value["jobs"]
         assert isinstance(jobs, dict)
-        build = jobs["build-and-measure"]
+        build = jobs["build"]
         assert isinstance(build, dict)
         build["strategy"] = {"matrix": {"allocator": ["a", "b"]}}
         with self.assertRaisesRegex(policy.ScalingWorkflowError, "parallel matrices"):
+            policy.validate(value)
+
+    def test_measure_matrix_is_rejected_to_preserve_one_host(self) -> None:
+        value = self.workflow()
+        jobs = value["jobs"]
+        assert isinstance(jobs, dict)
+        measure = jobs["measure"]
+        assert isinstance(measure, dict)
+        measure["strategy"] = {"fail-fast": False, "matrix": {"shard": [0, 1, 2, 3, 4, 5]}}
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "one host"):
+            policy.validate(value)
+
+    def test_measure_shard_loop_must_cover_six_points(self) -> None:
+        value = self.workflow()
+        jobs = value["jobs"]
+        assert isinstance(jobs, dict)
+        measure = jobs["measure"]
+        assert isinstance(measure, dict)
+        run = policy.steps_by_name(measure)["run sparse scaling sweep"]
+        run["run"] = str(run["run"]).replace("0 1 2 3 4 5", "0 1 2")
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "SHARD"):
             policy.validate(value)
 
     def test_separate_concurrency_group_is_rejected(self) -> None:
@@ -112,9 +133,9 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         value = self.workflow()
         jobs = value["jobs"]
         assert isinstance(jobs, dict)
-        build = jobs["build-and-measure"]
-        assert isinstance(build, dict)
-        eligibility = policy.steps_by_name(build)["compute publication eligibility"]
+        assemble = jobs["assemble"]
+        assert isinstance(assemble, dict)
+        eligibility = policy.steps_by_name(assemble)["compute publication eligibility"]
         eligibility["run"] = str(eligibility["run"]).replace("-eq 3", "-ge 1")
         with self.assertRaisesRegex(policy.ScalingWorkflowError, "eq 3"):
             policy.validate(value)
@@ -123,7 +144,7 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         value = self.workflow()
         jobs = value["jobs"]
         assert isinstance(jobs, dict)
-        build = jobs["build-and-measure"]
+        build = jobs["build"]
         assert isinstance(build, dict)
         seed = policy.steps_by_name(build)["determine run seed"]
         seed["run"] = 'SEED="${{ inputs.run_seed }}"'
@@ -134,9 +155,9 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         value = self.workflow()
         jobs = value["jobs"]
         assert isinstance(jobs, dict)
-        build = jobs["build-and-measure"]
-        assert isinstance(build, dict)
-        raw = policy.steps_by_name(build)["upload raw scaling artifact"]
+        measure = jobs["measure"]
+        assert isinstance(measure, dict)
+        raw = policy.steps_by_name(measure)["upload raw scaling shard"]
         raw_with = raw["with"]
         assert isinstance(raw_with, dict)
         raw_with["retention-days"] = 1

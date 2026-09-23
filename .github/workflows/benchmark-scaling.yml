@@ -8,8 +8,8 @@ name: benchmark-scaling
 # 25% with the Bun row (#325), which also adds a fifth benchmark-child build, and grew
 # another 50% with the two named workloads (#216). The 2026 live run measured 3m01s of
 # sweep in a 10m00s job before the distribution workloads were added. The 30-minute
-# bound budgets the 40-repetition additions; if a run times out,
-# raise timeout-minutes rather than dropping a thread point, a pattern, or a row.
+# measurement job has an owner-approved 120-minute bound (#424). Six thread-point
+# shards run serially on one Linux VM; the reporting job merges their raw outputs.
 # ci/check_benchmark_scaling_workflow.py pins the thread points and pattern ids in
 # rust/benchmark-suite/src/scaling.rs to the ones ci/benchmark_report.py validates, so
 # the two halves of the contract cannot drift apart silently.
@@ -48,38 +48,35 @@ env:
   PUBLISH_REF: refs/heads/benchmark-stats
 
 jobs:
-  build-and-measure:
+  build:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
     outputs:
-      publish_eligible: ${{ steps.eligibility.outputs.publish_eligible }}
-      mode: ${{ inputs.mode || 'full' }}
-      prior_branch_sha: ${{ steps.prior.outputs.prior_sha }}
+      run_seed: ${{ steps.seed.outputs.seed }}
     steps:
       - uses: actions/checkout@v4.4.0
         with:
           persist-credentials: false
       - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
+        with:
+          cache-preset: full
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
+      - name: cache native allocator trees
+        uses: actions/cache@v4.2.4
+        with:
+          path: |
+            rust/target/release/archives
+            rust/target/release/build
+            rust/target/release/sources
+          key: benchmark-allocators-${{ runner.os }}-${{ hashFiles('rust/benchmark-suite/allocators/allocator-lock.json', 'rust/benchmark-suite/allocators/patches/**', 'include/**', 'src/**', 'CMakeLists.txt', 'ci/build_benchmark_allocators.py') }}
       - name: build native allocator libraries
         run: |
           set -euxo pipefail
           python3 ci/build_benchmark_allocators.py --build-root rust/target/release --jobs "$(nproc)"
-      - name: resolve prior public site
-        id: prior
-        run: |
-          set -euxo pipefail
-          git ls-remote --exit-code origin "$PUBLISH_REF" >/dev/null
-          PRIOR_SHA=$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')
-          test -n "$PRIOR_SHA"
-          echo "prior_sha=$PRIOR_SHA" >> "$GITHUB_OUTPUT"
-          git fetch origin "$PUBLISH_REF" --depth=1
-          git checkout FETCH_HEAD -- history.jsonl latest.json
-          test -s history.jsonl
-          test -s latest.json
-          cp history.jsonl "$RUNNER_TEMP/history-input.jsonl"
-          cp latest.json "$RUNNER_TEMP/base-latest.json"
       - name: build benchmark suite
         run: |
           set -euxo pipefail
@@ -100,11 +97,45 @@ jobs:
           esac
           test "$SEED" -gt 0
           echo "seed=$SEED" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$SEED" > rust/target/release/scaling-run-seed.txt
+      - name: upload scaling build
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: benchmark-scaling-build-${{ github.run_id }}
+          overwrite: true
+          path: |
+            rust/target/release/build/
+            rust/target/release/sources/
+            rust/target/release/children/
+            rust/target/release/allocator-provenance.json
+            rust/target/release/benchmark-scaling-run
+            rust/target/release/benchmark-scaling-merge
+            rust/target/release/benchmark-scaling-validate
+            rust/target/release/scaling-run-seed.txt
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    needs: build
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-scaling-build-${{ github.run_id }}
+          path: rust/target/release/
+      - name: restore executable modes
+        run: |
+          chmod +x rust/target/release/benchmark-scaling-run
+          find rust/target/release/children -name benchmark-child -type f -exec chmod +x {} +
       - name: run sparse scaling sweep
         env:
           SCALING_MODE: ${{ inputs.mode || 'full' }}
           SCALING_BLOCKS: ${{ inputs.blocks || 3 }}
-          SCALING_RUN_SEED: ${{ steps.seed.outputs.seed }}
+          SCALING_RUN_SEED: ${{ needs.build.outputs.run_seed }}
         run: |
           set -euxo pipefail
           cd rust
@@ -115,19 +146,81 @@ jobs:
             test "$BLOCKS" = "1"
             SMOKE_FLAG="--reduced-smoke"
           fi
-          soldr cargo run -p benchmark-suite --bin benchmark-scaling-run --release -- \
-            $SMOKE_FLAG \
-            --blocks "$BLOCKS" \
-            --run-seed "$SCALING_RUN_SEED" \
-            --output-dir "$RUNNER_TEMP/scaling-output-${{ github.run_id }}" \
-            --build-root target/release
+          for SHARD in 0 1 2 3 4 5; do
+            target/release/benchmark-scaling-run \
+              $SMOKE_FLAG \
+              --blocks "$BLOCKS" \
+              --run-seed "$SCALING_RUN_SEED" \
+              --shard-index "$SHARD" \
+              --shard-count 6 \
+              --output-dir "$RUNNER_TEMP/scaling-output-${{ github.run_id }}/shard-$SHARD" \
+              --build-root target/release
+          done
+      - name: upload raw scaling shard
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: benchmark-scaling-shards-${{ github.run_id }}
+          overwrite: true
+          path: "${{ runner.temp }}/scaling-output-${{ github.run_id }}/"
+          include-hidden-files: true
+          retention-days: 30
+          if-no-files-found: error
+
+  assemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [build, measure]
+    permissions:
+      contents: read
+    outputs:
+      publish_eligible: ${{ steps.eligibility.outputs.publish_eligible }}
+      mode: ${{ inputs.mode || 'full' }}
+      prior_branch_sha: ${{ steps.prior.outputs.prior_sha }}
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-scaling-build-${{ github.run_id }}
+          path: rust/target/release/
+      - name: restore executable modes
+        run: chmod +x rust/target/release/benchmark-scaling-merge rust/target/release/benchmark-scaling-validate
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: benchmark-scaling-shards-${{ github.run_id }}
+          path: scaling-shards/
+      - name: resolve prior public site
+        id: prior
+        run: |
+          set -euxo pipefail
+          git ls-remote --exit-code origin "$PUBLISH_REF" >/dev/null
+          PRIOR_SHA=$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')
+          test -n "$PRIOR_SHA"
+          echo "prior_sha=$PRIOR_SHA" >> "$GITHUB_OUTPUT"
+          git fetch origin "$PUBLISH_REF" --depth=1
+          git checkout FETCH_HEAD -- history.jsonl latest.json
+          test -s history.jsonl
+          test -s latest.json
+          cp history.jsonl "$RUNNER_TEMP/history-input.jsonl"
+          cp latest.json "$RUNNER_TEMP/base-latest.json"
+      - name: merge scaling shards
+        run: |
+          set -euxo pipefail
+          mapfile -t SHARDS < <(find scaling-shards -name scaling-raw-run.json -type f | sort)
+          test "${#SHARDS[@]}" -eq 6
+          INPUTS=()
+          for SHARD in "${SHARDS[@]}"; do INPUTS+=(--input "$SHARD"); done
+          rust/target/release/benchmark-scaling-merge \
+            "${INPUTS[@]}" \
+            --report-out "$RUNNER_TEMP/scaling-raw-run.json"
       - name: validate and overlay complete scaling report
         if: (inputs.mode || 'full') == 'full'
         run: |
           set -euxo pipefail
-          cd rust
-          soldr cargo run -p benchmark-suite --bin benchmark-scaling-validate --release -- \
-            --input "$RUNNER_TEMP/scaling-output-${{ github.run_id }}/scaling-raw-run.json" \
+          rust/target/release/benchmark-scaling-validate \
+            --input "$RUNNER_TEMP/scaling-raw-run.json" \
             --base-latest "$RUNNER_TEMP/base-latest.json" \
             --report-out "$RUNNER_TEMP/scaling-report.json" \
             --latest-out "$RUNNER_TEMP/latest.json"
@@ -162,13 +255,13 @@ jobs:
             ELIGIBLE=true
           fi
           echo "publish_eligible=$ELIGIBLE" >> "$GITHUB_OUTPUT"
-      - name: upload raw scaling artifact
+      - name: upload merged raw scaling artifact
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
           name: benchmark-scaling-raw-${{ github.run_id }}
           overwrite: true   # a re-run of this job replaces attempt 1's upload (#341)
-          path: "${{ runner.temp }}/scaling-output-${{ github.run_id }}/"
+          path: "${{ runner.temp }}/scaling-raw-run.json"
           include-hidden-files: true
           retention-days: 30
           if-no-files-found: error
@@ -197,8 +290,8 @@ jobs:
   artifact-audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: build-and-measure
-    if: needs.build-and-measure.outputs.mode == 'full'
+    needs: assemble
+    if: needs.assemble.outputs.mode == 'full'
     permissions:
       contents: read
     steps:
@@ -222,8 +315,8 @@ jobs:
   publish-branch:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: [build-and-measure, artifact-audit]
-    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    needs: [assemble, artifact-audit]
+    if: needs.assemble.outputs.publish_eligible == 'true'
     permissions:
       contents: write
     steps:
@@ -252,7 +345,7 @@ jobs:
             --revision HEAD \
             --site-dir "$GITHUB_WORKSPACE/site-temp"
           git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          git push origin "HEAD:$PUBLISH_REF" --force-with-lease="refs/heads/benchmark-stats:${{ needs.build-and-measure.outputs.prior_branch_sha }}"
+          git push origin "HEAD:$PUBLISH_REF" --force-with-lease="refs/heads/benchmark-stats:${{ needs.assemble.outputs.prior_branch_sha }}"
           test "$(git ls-remote origin "$PUBLISH_REF" | awk '{print $1}')" = "$(git rev-parse HEAD)"
           cd "$GITHUB_WORKSPACE"
           git worktree remove --force "$WORKTREE"
@@ -260,8 +353,8 @@ jobs:
   package-pages:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: [build-and-measure, artifact-audit, publish-branch]
-    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    needs: [assemble, artifact-audit, publish-branch]
+    if: needs.assemble.outputs.publish_eligible == 'true'
     permissions:
       contents: read
     steps:
@@ -277,8 +370,8 @@ jobs:
   deploy-pages:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: [build-and-measure, artifact-audit, publish-branch, package-pages]
-    if: needs.build-and-measure.outputs.publish_eligible == 'true'
+    needs: [assemble, artifact-audit, publish-branch, package-pages]
+    if: needs.assemble.outputs.publish_eligible == 'true'
     permissions:
       pages: write
       id-token: write
@@ -294,8 +387,8 @@ jobs:
   publication-audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: [build-and-measure, publish-branch, deploy-pages]
-    if: needs.build-and-measure.outputs.publish_eligible == 'true' && always()
+    needs: [assemble, publish-branch, deploy-pages]
+    if: needs.assemble.outputs.publish_eligible == 'true' && always()
     permissions:
       contents: read
     steps:
