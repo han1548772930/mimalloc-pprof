@@ -10,7 +10,14 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from bench_arena_reclaim import METRICS, PHASES, THREAD_STATES, svg, validate_report
+from bench_arena_reclaim import (
+    METRICS,
+    PHASES,
+    THREAD_STATES,
+    svg,
+    validate_report,
+    validate_source_pins,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "ci/bench_arena_reclaim.py"
@@ -115,6 +122,16 @@ def test_rejects_missing_no_op_reason() -> None:
     raise AssertionError("missing no-op reason was accepted")
 
 
+def test_rejects_busy_ordinary_purge() -> None:
+    data = fixture_data()
+    data["records"][0]["samples"][3]["purge_status"] = 2
+    try:
+        validate_report(data)
+    except ValueError:
+        return
+    raise AssertionError("busy ordinary purge was accepted as a baseline")
+
+
 def test_baseline_skips_unsafe_retained_id_only() -> None:
     data = fixture_data()
     data["is_baseline"] = True
@@ -167,3 +184,24 @@ def test_changed_raw_data_makes_render_stale(tmp_path: Path) -> None:
             record["samples"][4]["rss_bytes"] += 1048576
     data.write_text(json.dumps(report), encoding="utf-8")
     assert subprocess.run([*command, "--check"], capture_output=True).returncode != 0
+
+
+def test_committed_raw_artifacts_are_complete_and_pinned() -> None:
+    source_sha: str | None = None
+    for platform, toolchain in (("linux", "unix"), ("msvc", "msvc"), ("mingw", "mingw")):
+        for revision in ("pr", "main"):
+            path = ROOT / f".github/assets/arena-reclaim-{platform}-{revision}.json"
+            report = json.loads(path.read_text(encoding="utf-8"))
+            validate_report(report)
+            validate_source_pins(report)
+            assert report["host"]["toolchain"] == toolchain
+            assert report["is_baseline"] is (revision == "main")
+            if revision == "main":
+                assert report["allocator_source_sha"] == (
+                    "d5bdb464debf59d0816eeac038d9d4423736c9c4"
+                )
+            else:
+                assert report["allocator_source_sha"] == report["source_sha"]
+            if source_sha is None:
+                source_sha = report["source_sha"]
+            assert report["source_sha"] == source_sha

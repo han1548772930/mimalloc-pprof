@@ -115,6 +115,11 @@ def validate_samples(
             raise ValueError("reclaim flag reported outside reclaim phase")
         if not sample["reclaim_requested"] and sample.get("reclaim_result") != "not-requested":
             raise ValueError("unexpected result for unrequested reclaim")
+    for row in (samples[3], samples[7]):
+        if row["purge_status"] == 2:
+            raise ValueError("ordinary purge was busy and did not run")
+        if thread_state == "none" and row["purge_status"] != 0:
+            raise ValueError("no-worker ordinary purge did not complete")
     reclaim_rows = (samples[4], samples[8])
     for row in reclaim_rows:
         if row["reclaim_requested"] != (mode == "reclaim"):
