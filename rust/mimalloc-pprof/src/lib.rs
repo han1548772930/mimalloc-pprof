@@ -444,7 +444,8 @@ impl PurgeFlags {
     /// feature that is every thread outside an allocator call; otherwise the threads
     /// parked in [`park_while_idle`]). A sub-process where that cannot be established is
     /// reported in [`PurgeAllReport::subprocs_pending`] with nothing released, and the
-    /// call is then simply a purge: it never waits on a lock it holds and never blocks.
+    /// call is then simply a purge. It may use the `wait_ms` owner-acquisition
+    /// budget, but never waits while holding the arena lock.
     ///
     /// ```no_run
     /// # use mimalloc_pprof as mi;
