@@ -74,8 +74,10 @@ is **completely free**:
    it is immediately reusable by `mi_arenas_add` (which prefers a NULL slot); `arena_count`
    is decremented only when the released arena was the last slot (the same CAS
    `mi_arenas_unsafe_destroy` does).
-5. **Return it to the OS.** `_mi_os_free_ex(subproc, arena, mi_size_of_slices(slice_count),
-   true, memid)` — the whole reservation, metadata included.
+5. **Return it to the OS.** The arena's own share of the `committed` statistic is debited first
+   (see the note below), and then
+   `_mi_os_free_ex(subproc, arena, mi_size_of_slices(slice_count), false, memid)` returns the
+   whole reservation, metadata included; `reserved` drops by that same size.
 6. **Sweep the leftovers.** A second pass frees any `heap->arena_pages[i]` from another heap
    whose `subproc->arenas[i]` is NULL by now (detached under that heap's own
    `arena_pages_lock`). Leaving one in place would be latent corruption: slot `i` can be
@@ -90,6 +92,17 @@ The report says what happened:
 | `arenas_kept` | seen completely free and **not** released — not the library's to give back (the `exclusive`/pinned/external cases above) |
 | `subprocs_pending` | sub-processes where the proof below failed; nothing was released there |
 | `reclaimed` | the flag was passed and nothing blocked a pass (no pending sub-process, no other arena pass in flight). Says the pass *ran* — `arenas_reclaimed` says whether it found anything |
+
+A release moves two statistics by different amounts. `reserved` falls by exactly
+`arena_reclaim_bytes`. `committed` falls by the **arena's own commit**, not by the reservation:
+on Windows the 1 GiB arena above carries ~2.8 MiB of committed metadata — its info block — and no
+committed data once the peak has been purged, and `committed` is the number a host actually
+watches. That debit is read from the same record the arena layer credits from (`src/arena.c`):
+the arena's commit bits, or `slices_dirty` on an overcommitting OS, where `mi_arena_reserve`
+cancels the reservation's credit again at reserve time and the slices are counted as they are
+first handed out. `mi_arenas_unsafe_destroy` passes `still_committed = true` because it runs at
+process exit; a live process must not, since the whole reservation would be debited on top of
+that and `committed` would be walked below zero.
 
 ## 4. Why it needs quiescence, and how it gets it
 

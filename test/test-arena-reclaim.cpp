@@ -6,8 +6,9 @@
    A2  WITHOUT the flag nothing is ever released: the same call with the same live set leaves
        the arena accounting byte-for-byte unchanged (positive control for the flag itself);
    A3  with the flag, every arena that is completely free is released, the live objects in the
-       arenas that are NOT free survive byte-for-byte, and `arenas_kept == 0` (no arena was left
-       behind that the reclaim could have released);
+       arenas that are NOT free survive byte-for-byte, `arenas_kept == 0` (no arena was left
+       behind that the reclaim could have released), and the `committed` statistic loses the
+       released arenas' own commit -- never the reservation, and never more than it holds;
    A4  the accounting moves by exactly the reported `arena_reclaim_bytes`, and after the last
        live object is gone the remaining arenas go too -- i.e. the metadata follows the LIVE set
        and not the process's peak;
@@ -37,6 +38,7 @@
    mingw-w64 toolchains ship the win32 threads model). A hang fails through ctest's TIMEOUT. */
 
 #include <mimalloc.h>
+#include <mimalloc-stats.h>   // mi_stats_get: the `committed` statistic the release debits
 
 #include <atomic>
 #include <cstdint>
@@ -126,6 +128,18 @@ static arena_accounting_t accounting(void) {
   return a;
 }
 
+// The sub-process's `committed` statistic (the exported accessor, not the internals). Releasing an
+// arena must take away the memory that arena itself held committed -- above all its info block,
+// i.e. exactly the metadata this phase exists for -- and the reservation is a different number: on
+// Windows a reservation that was never committed is not in `committed` at all, so debiting the
+// whole reservation (what `mi_arenas_unsafe_destroy` does, harmlessly, at process exit) walks a
+// live process's statistic past zero and leaves it corrupt for the rest of the run. Rows A3/A4 pin
+// both ends: the number must stay positive, and the debit must not exceed what was released.
+static int64_t committed_stat(void) {
+  mi_stats_t_decl(stats);   // the API checks size/version: a zeroed struct is rejected
+  return (mi_stats_get(&stats) ? stats.committed.current : -1);
+}
+
 static void* big_alloc(size_t n, unsigned char pattern) {
   void* p = mi_malloc(n);
   if (p == NULL) { printf("  out of memory for %zu bytes\n", n); exit(2); }
@@ -199,10 +213,13 @@ static void run_reclaim_rows(void) {
   check(after_plain.reserved == before.reserved && after_plain.meta == before.meta, "A2: the arena accounting is unchanged by the control call");
 
   // A3: the reclaim itself.
+  const int64_t committed_before = committed_stat();
   const mi_purge_all_report_t rep = reclaim_all();
   const arena_accounting_t after = accounting();
-  printf("  reclaimed %zu arenas / %.1f MiB; pending subprocs %zu; kept %zu\n",
-         rep.arenas_reclaimed, (double)rep.arena_reclaim_bytes / (1024.0 * 1024.0), rep.subprocs_pending, rep.arenas_kept);
+  const int64_t committed_after = committed_stat();
+  printf("  reclaimed %zu arenas / %.1f MiB; pending subprocs %zu; kept %zu; committed %lld B\n",
+         rep.arenas_reclaimed, (double)rep.arena_reclaim_bytes / (1024.0 * 1024.0), rep.subprocs_pending, rep.arenas_kept,
+         (long long)(committed_after - committed_before));
   check(rep.reclaimed, "A3: the reclaim ran (no thread was inside the allocator)");
   check(rep.arenas_reclaimed >= 2, "A3: both completely free arenas were released");
   check(rep.arena_reclaim_bytes >= 2 * arena_size, "A3: the released bytes cover both reservations");
@@ -210,18 +227,22 @@ static void run_reclaim_rows(void) {
   check(rep.subprocs_pending == 0, "A3: no sub-process was pending");
   check(after.reserved + rep.arena_reclaim_bytes == before.reserved, "A3: reserved address space dropped by exactly the reported bytes");
   check(after.meta < before.meta, "A3: the arenas' metadata dropped with them");
+  check(committed_before > 0 && committed_after > 0, "A3: the committed statistic stayed positive across the release");
+  check(committed_before - committed_after <= (int64_t)rep.arena_reclaim_bytes, "A3: the committed debit never exceeds the released reservations");
   check(big_verify(big[0], BIG_BYTES, 0x40) && big_verify(big[2], BIG_BYTES, 0x42), "A3: the live objects in the non-free arenas survived byte-for-byte");
 
   // A4: free what is left and reclaim again -- after that, the metadata of the peak is gone.
   mi_free(big[0]); mi_free(big[2]);
   const mi_purge_all_report_t rep2 = reclaim_all();
   const arena_accounting_t after2 = accounting();
+  const int64_t committed_after2 = committed_stat();
   printf("  reclaimed %zu arenas / %.1f MiB more; metadata now %.3f MiB\n",
          rep2.arenas_reclaimed, (double)rep2.arena_reclaim_bytes / (1024.0 * 1024.0), (double)after2.meta / (1024.0 * 1024.0));
   check(rep2.reclaimed && rep2.arenas_reclaimed >= 1, "A4: the remaining arenas of the peak were released too");
   check(after2.reserved + rep2.arena_reclaim_bytes == after.reserved, "A4: reserved address space dropped by exactly the reported bytes");
   check(after2.meta < first.meta, "A4: the peak's metadata is gone -- only what is still live is accounted for");
   check(after2.reserved <= small.reserved, "A4: the peak's address space is gone too (only what the small object needed may stay)");
+  check(committed_after2 > 0, "A4: `committed` stayed positive across the second release too");
   mi_free(keep_small);
 }
 

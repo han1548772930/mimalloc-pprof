@@ -245,11 +245,36 @@ static bool mi_arena_reclaim_one(mi_subproc_t* subproc, size_t idx, mi_arena_t* 
     mi_atomic_cas_strong_acq_rel(&subproc->arena_count, &expected, count - 1);
   }
 
-  // And back to the OS -- reservation, metadata and all. `still_committed = true` mirrors
-  // `mi_arenas_unsafe_destroy`: the arena's own memory was committed when it was initialized
-  // (`mi_arena_initialize` commits the info block, and an initially-committed arena counts the
-  // whole reservation), so the subproc's committed statistics must drop by the same amount.
-  _mi_os_free_ex(subproc, (void*)arena, asize, true /* still committed */, memid);
+  // And back to the OS -- reservation, metadata and all. What leaves the `committed` statistic is
+  // NOT the reservation: it is what this arena was actually credited with, and the arena layer
+  // records that in two different places (src/arena.c):
+  //   - memory that arrived committed on an overcommitting OS (Linux, `arena_eager_commit = 2`:
+  //     `mi_arena_reserve` cancels the credit of the reservation again and the slices are counted
+  //     when they are first handed out -- `slices_dirty` is what `mi_arena_try_alloc_at` reads for
+  //     that, while the commit bits stay set for the whole arena from reserve time);
+  //   - everywhere else (Windows): the commit bits ARE the record -- the info block, committed by
+  //     `mi_arena_initialize` when the memory did NOT arrive committed (the metadata this phase
+  //     exists to give back), plus every data slice still marked committed.
+  // `still_committed = true` -- what `mi_arenas_unsafe_destroy` can afford at process exit, where
+  // nothing reads the number again -- would debit the whole reservation on top of this and walk a
+  // *live* process's `committed` past zero.
+  const size_t guard_bytes = (memid.is_pinned ? 0 : _mi_os_secure_guard_page_size());
+  size_t committed_bytes;
+  if (memid.initially_committed && _mi_os_has_overcommit()) {
+    committed_bytes = mi_size_of_slices(mi_bitmap_popcountN(arena->slices_dirty, arena->info_slices,
+                                                             arena->slice_count - arena->info_slices));
+  }
+  else {
+    committed_bytes = mi_size_of_slices(mi_bitmap_popcountN(arena->slices_committed, 0, arena->slice_count));
+    if (!memid.initially_committed) {
+      committed_bytes += mi_size_of_slices(arena->info_slices);
+    }
+  }
+  committed_bytes = (committed_bytes > guard_bytes ? committed_bytes - guard_bytes : 0);
+  if (committed_bytes > 0) {
+    mi_subproc_stat_decrease(subproc, committed, committed_bytes);
+  }
+  _mi_os_free_ex(subproc, (void*)arena, asize, false /* committed debited above */, memid);
 
   rep->arenas_reclaimed++;
   rep->reclaim_bytes += asize;
