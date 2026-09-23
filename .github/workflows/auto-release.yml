@@ -12,9 +12,8 @@ name: auto-release
 # #277 row E originally said "shipped release assets stay built by the platform's own
 # toolchain". Two owner decisions since then overrode it:
 #
-#   1. No macOS build or test may run on a native Mac runner anywhere in this repository
-#      (enforced by ci/lint_no_macos_runners.py, which this workflow is checked by). There
-#      is therefore no Apple toolchain available to build an Apple asset with.
+#   1. Native Mac runners are used for opt-in full test execution, not to build
+#      shipped assets. The Linux cross-built bytes remain the product under test.
 #   2. Cross-compilation is a PRODUCT requirement, not a CI cost measure: mimalloc-pprof
 #      ships inside cross-compiled code, so the Linux-cross-built artifact IS the product.
 #      Shipping a natively-built binary while testing a cross-built one would mean the
@@ -27,8 +26,7 @@ name: auto-release
 #
 # What that costs, stated rather than hidden:
 #   - macOS assets are built by soldr's clang 21 against soldr's Apple SDK, NOT by Xcode's
-#     clang against Xcode's SDK. Nothing in this repository compiles with Apple's toolchain
-#     any more (docs/ci-gates.md, "macOS").
+#     clang against Xcode's SDK (docs/ci-gates.md, "macOS").
 #   - The `windows-x64-msvc` asset is MSVC-ABI, but built by clang-cl + lld-link with the
 #     CRT pinned to /MD -- it is not a `cl` binary. c-unit.yml keeps one native `cl`
 #     Release ctest job as the correctness gate for `cl` (CLAUDE.md rule 3); that job ships
@@ -45,14 +43,12 @@ name: auto-release
 #
 # Trigger design (see rust/mimalloc-pprof/vendor/README.md for what gets shipped):
 #   - workflow_dispatch: manual, explicit human/agent decision. Default `dry_run: true`
-#     so this can be exercised safely (build + package + `cargo publish --dry-run`,
-#     draft GitHub Release) without publishing anything for real.
-#   - push tags `v*`: tagging a commit drives a REAL release (dry_run is forced off).
-#     `cargo publish` fails loudly (not silently) if the crate version doesn't match
-#     what's already on crates.io, so a re-run/duplicate tag push is a safe no-op-or-error,
-#     not a silent re-publish.
+#     so this can be exercised safely (build + package + `cargo publish --dry-run`)
+#     without creating a tag or GitHub Release.
+#   - A real manual run requires a successful full macOS run on this exact candidate SHA.
+#     A tag push cannot start publication.
 #
-# A real run (dry_run=false or tag push) does exactly one irreversible thing:
+# A real run (dry_run=false) does exactly one irreversible thing:
 # `cargo publish -p mimalloc-pprof` to crates.io. Everything else (the GitHub Release,
 # the ZIP) can be deleted/recreated by hand if needed.
 
@@ -60,13 +56,34 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run: build, package, and cargo publish --dry-run only -- no real publish, draft release"
+        description: "Dry run: build, package, and cargo publish --dry-run only; create no tag or release"
         required: false
         type: boolean
         default: true
-  push:
-    tags:
-      - 'v*'
+      candidate_sha:
+        description: "Exact candidate commit SHA (required for a real release)"
+        required: false
+        type: string
+      full_run_id:
+        description: "Successful macos-bundles full run ID at candidate_sha (required for a real release)"
+        required: false
+        type: string
+      c_unit_run_id:
+        description: "Full c-unit run ID at candidate_sha"
+        required: false
+        type: string
+      windows_bundles_run_id:
+        description: "Full windows-bundles run ID at candidate_sha"
+        required: false
+        type: string
+      cross_run_id:
+        description: "Full cross run ID at candidate_sha"
+        required: false
+        type: string
+      rust_native_run_id:
+        description: "Full rust-native run ID at candidate_sha"
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -76,9 +93,7 @@ permissions:
   contents: write
 
 env:
-  # Tag pushes are always a real release; workflow_dispatch defers to the dry_run input
-  # (which defaults to true, so manual runs are safe-by-default).
-  IS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+  IS_DRY_RUN: ${{ inputs.dry_run }}
 
 jobs:
   build-and-package:
@@ -95,6 +110,14 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
+      - name: Verify package checkout is the release candidate
+        if: env.IS_DRY_RUN != 'true'
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" || { echo '::error::package checkout differs from candidate_sha'; exit 1; }
 
       # Retried on purpose: this action has failed with a transient `write EPIPE`
       # during cache restore (issue #55), which skipped the publish job and turned a
@@ -181,6 +204,14 @@ jobs:
             archive: zip
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
+      - name: Verify binary checkout is the release candidate
+        if: env.IS_DRY_RUN != 'true'
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" || { echo '::error::binary checkout differs from candidate_sha'; exit 1; }
       - uses: astral-sh/setup-uv@v3
       - uses: zackees/setup-soldr@v0
         with:
@@ -327,9 +358,9 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "mimalloc-pprof ${GITHUB_REF_NAME} -- ${{ matrix.asset }}"
+            echo "mimalloc-pprof $(git rev-parse HEAD) -- ${{ matrix.asset }}"
             echo
-            echo "commit:   ${GITHUB_SHA}"
+            echo "commit:   $(git rev-parse HEAD)"
             echo "target:   ${TRIPLE}"
             echo "built on: ubuntu-latest (Linux), cross-compiled through soldr $(soldr --version 2>/dev/null || echo '?')"
             echo "config:   -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_TESTS=OFF"
@@ -397,10 +428,79 @@ jobs:
     needs: [build-and-package, build-binaries]
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
+          fetch-depth: 0 # origin/main is needed to prove a real candidate was merged
+
+      - name: Require exact-SHA full native macOS evidence before any release write
+        if: env.IS_DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          FULL_RUN_ID: ${{ inputs.full_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::candidate_sha must be a full commit SHA'; exit 1; }
+          [[ "$FULL_RUN_ID" =~ ^[0-9]+$ ]] || { echo '::error::full_run_id is required'; exit 1; }
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" || { echo '::error::checkout HEAD differs from candidate_sha'; exit 1; }
+          git merge-base --is-ancestor "$CANDIDATE_SHA" origin/main || { echo '::error::release candidate is not merged into origin/main'; exit 1; }
+          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$FULL_RUN_ID")
+          workflow_id=$(jq -er '.workflow_id' <<< "$run_json")
+          workflow_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id")
+          test "$(jq -r '.path' <<< "$workflow_json")" = '.github/workflows/macos-bundles.yml' || { echo '::error::full_run_id is not macos-bundles.yml'; exit 1; }
+          test "$(jq -r '.event' <<< "$run_json")" = workflow_dispatch || { echo '::error::release evidence must be an explicit full dispatch'; exit 1; }
+          test "$(jq -r '.head_branch' <<< "$run_json")" = main || { echo '::error::full run workflow source must be main'; exit 1; }
+          test "$(jq -r '.display_title' <<< "$run_json")" = "macos-bundles/full/$CANDIDATE_SHA" || { echo '::error::full run candidate title differs from release candidate'; exit 1; }
+          test "$(jq -r '.conclusion' <<< "$run_json")" = success || { echo '::error::full run did not succeed'; exit 1; }
+          # Fetch all pages. Matrix jobs can exceed the default API page size.
+          jobs_json=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$FULL_RUN_ID/jobs?per_page=100" --jq '.jobs[] | {name, status, conclusion}')
+          verifier_name='resolve-candidate (exact SHA)'
+          verifier_count=$(jq -s --arg name "$verifier_name" '[.[] | select(.name == $name)] | length' <<< "$jobs_json")
+          verifier_success=$(jq -s --arg name "$verifier_name" '[.[] | select(.name == $name and .status == "completed" and .conclusion == "success")] | length' <<< "$jobs_json")
+          test "$verifier_count" = 1 && test "$verifier_success" = 1 || { echo '::error::full run candidate identity verifier is missing, incomplete, duplicate, or failed'; exit 1; }
+          for arch in arm64 x64; do
+            name="run-macos-native-full ($arch)"
+            count=$(jq -s --arg name "$name" '[.[] | select(.name == $name)] | length' <<< "$jobs_json")
+            success_count=$(jq -s --arg name "$name" '[.[] | select(.name == $name and .status == "completed" and .conclusion == "success")] | length' <<< "$jobs_json")
+            test "$count" = 1 && test "$success_count" = 1 || { echo "::error::required full macOS job $name is missing, incomplete, duplicate, or failed"; exit 1; }
+          done
+          echo "full native macOS evidence: run $FULL_RUN_ID, candidate $CANDIDATE_SHA"
+
+      - name: Require versioned all-platform exact-SHA CI evidence before publication
+        if: env.IS_DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          MACOS_RUN_ID: ${{ inputs.full_run_id }}
+          C_UNIT_RUN_ID: ${{ inputs.c_unit_run_id }}
+          WINDOWS_BUNDLES_RUN_ID: ${{ inputs.windows_bundles_run_id }}
+          CROSS_RUN_ID: ${{ inputs.cross_run_id }}
+          RUST_NATIVE_RUN_ID: ${{ inputs.rust_native_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for id in "$MACOS_RUN_ID" "$C_UNIT_RUN_ID" "$WINDOWS_BUNDLES_RUN_ID" "$CROSS_RUN_ID" "$RUST_NATIVE_RUN_ID"; do
+            [[ "$id" =~ ^[1-9][0-9]*$ ]] || { echo '::error::all five full CI run IDs are required'; exit 1; }
+          done
+          run_ids=$(jq -cn \
+            --argjson macos "$MACOS_RUN_ID" --argjson c "$C_UNIT_RUN_ID" \
+            --argjson windows "$WINDOWS_BUNDLES_RUN_ID" --argjson cross "$CROSS_RUN_ID" \
+            --argjson rust "$RUST_NATIVE_RUN_ID" \
+            '{"macos-bundles.yml": $macos, "c-unit.yml": $c, "windows-bundles.yml": $windows, "cross.yml": $cross, "rust-native.yml": $rust}')
+          python3 ci/release_full_ci_gate.py --candidate-sha "$CANDIDATE_SHA" --run-ids-json "$run_ids"
+
+      - name: Require fleet all-platform full gate before publication
+        if: env.IS_DRY_RUN != 'true'
+        shell: bash
+        run: |
+          echo '::error::The issue-driven release worker, destination preflight, and retry/resume controls are not implemented yet; real publication is disabled.'
+          exit 1
 
       # Retried on purpose: this action has failed with a transient `write EPIPE`
       # during cache restore (issue #55), which skipped the publish job and turned a
@@ -441,28 +541,19 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Determine release tag
+      - name: Determine artifact suffix and release tag
         id: tag
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          if [ "$IS_DRY_RUN" = "true" ]; then
+            # A dry run names its local assets with the exact candidate SHA.
+            # It does not create or name a Git tag.
+            echo "suffix=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=manual-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            candidate=$(git rev-parse HEAD)
+            echo "tag=manual-${candidate::7}" >> "$GITHUB_OUTPUT"
+            echo "suffix=manual-${candidate::7}" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Verify tag matches Cargo.toml version (tag-push releases only)
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo_version="$(grep -m1 '^version' rust/mimalloc-pprof/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [ "$cargo_version" != "$tag_version" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} (version $tag_version) does not match rust/mimalloc-pprof/Cargo.toml's version ($cargo_version). Refusing to publish a mismatched release -- fix the tag or bump Cargo.toml and re-tag."
-            exit 1
-          fi
-          echo "tag version $tag_version matches Cargo.toml version $cargo_version"
 
       - name: Rename assets to versioned artifact names, and require all five
         # Five, counted: the architecture-independent C amalgamation ZIP plus one archive
@@ -472,7 +563,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag='${{ steps.tag.outputs.tag }}'
+          tag='${{ steps.tag.outputs.suffix }}'
           mv dist/mimalloc-pprof-c.zip "dist/mimalloc-pprof-c-${tag}.zip"
           for asset in macos-arm64 macos-x86_64 windows-x64-gnu windows-x64-msvc; do
             case "$asset" in macos-*) ext=tar.gz ;; *) ext=zip ;; esac
@@ -539,11 +630,12 @@ jobs:
           exit 1
 
       - name: Create GitHub Release
+        if: env.IS_DRY_RUN != 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: mimalloc-pprof ${{ steps.tag.outputs.tag }}
-          draft: ${{ env.IS_DRY_RUN == 'true' }}
+          draft: false
           files: |
             dist/mimalloc-pprof-c-${{ steps.tag.outputs.tag }}.zip
             dist/mimalloc-pprof-macos-arm64-${{ steps.tag.outputs.tag }}.tar.gz
@@ -559,10 +651,10 @@ jobs:
   release-outcome:
     name: Release outcome check
     needs: [build-and-package, build-binaries, release]
-    if: always() && github.event_name == 'push'
+    if: always() && inputs.dry_run == false
     runs-on: ubuntu-latest
     steps:
-      - name: Fail loudly if the tag did not produce a release
+      - name: Fail loudly if the candidate did not produce a release
         shell: bash
         run: |
           build='${{ needs.build-and-package.result }}'
@@ -572,8 +664,8 @@ jobs:
           echo "build-binaries: ${binaries}"
           echo "release: ${release}"
           if [ "$release" = "success" ]; then
-            echo "tag ${GITHUB_REF_NAME} released successfully"
+            echo "candidate ${{ inputs.candidate_sha }} released successfully"
             exit 0
           fi
-          echo "::error::Tag ${GITHUB_REF_NAME} was pushed but NOT released (build=${build}, binaries=${binaries}, release=${release}). Nothing was published to crates.io. If this was a transient runner failure, recover with: gh run rerun ${GITHUB_RUN_ID} --failed"
+          echo "::error::Candidate ${{ inputs.candidate_sha }} was NOT released (build=${build}, binaries=${binaries}, release=${release}). Check destination state before retrying run ${GITHUB_RUN_ID}."
           exit 1
