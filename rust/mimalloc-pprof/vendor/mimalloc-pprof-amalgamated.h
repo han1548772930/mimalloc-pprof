@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit bcd0c7d4 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 7b430570 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -214,9 +214,11 @@ mi_decl_export void mi_on_thread_idle_end(void) mi_attr_noexcept;
 // registered thread's pages and holes -- and reports exactly what it could not reach.
 typedef enum mi_purge_flags_e {
   MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed sweep runs to completion (ignores park_reclaim)
-  // After the walk (phase F, docs/arena-reclaim.md): give back every arena of every sub-process
-  // that is COMPLETELY free --
-  // its metadata included (phase F, docs/arena-reclaim.md). That needs every thread of the
+  // After the walk (phase F, docs/arena-reclaim.md): give back allocator-owned arenas
+  // of every sub-process that are COMPLETELY free. Arenas created through the public
+  // reserve/manage APIs are retained, including non-exclusive arenas and those whose
+  // caller requested an arena ID; there is no public unpin operation. The release includes
+  // an allocator-owned arena's metadata. It needs every thread of the
   // sub-process OUT of the allocator at the same instant: a parked thread is claimable (a
   // MI_OWNER_GATE build parks every thread outside the allocator; otherwise
   // `mi_on_thread_idle_start` is the park), a thread inside a call is not, and its sub-process
@@ -235,7 +237,7 @@ typedef struct mi_purge_all_report_s {
   bool   complete;           // theaps_pending == 0 && theaps_orphaned == 0
   size_t arenas_reclaimed;   // phase F: arenas released to the OS (their metadata included)
   size_t arena_reclaim_bytes;// phase F: the reservation bytes those arenas held
-  size_t arenas_kept;        // phase F: arenas seen completely free and not released -- not ours to give back (see docs/arena-reclaim.md)
+  size_t arenas_kept;        // phase F: completely free arenas retained (e.g. public reserve/manage APIs; see docs/arena-reclaim.md)
   size_t subprocs_pending;   // phase F: sub-processes whose threads could not all be claimed (nothing released there)
   bool   reclaimed;          // phase F: the flag was set and nothing blocked a pass (no pending sub-process, arena layer free)
 } mi_purge_all_report_t;
@@ -481,6 +483,11 @@ mi_decl_export size_t mi_arena_min_alignment(void);
 mi_decl_export size_t mi_arena_min_size(void);
 
 typedef void* mi_arena_id_t;
+// A public reserve/manage call pins its arena against MI_PURGE_RECLAIM for the process
+// lifetime, whether or not arena_id is requested and whether or not it is exclusive.
+// In particular, a returned mi_arena_id_t remains valid after reclaim; there is no
+// public API to release the ID or unpin the arena. Reclaim only releases arenas
+// reserved internally by the allocator.
 mi_decl_export void*  mi_arena_area(mi_arena_id_t arena_id, size_t* size);
 mi_decl_export int    mi_reserve_huge_os_pages_at_ex(size_t pages, int numa_node, size_t timeout_msecs, bool exclusive, mi_arena_id_t* arena_id) mi_attr_noexcept;
 mi_decl_export int    mi_reserve_os_memory_ex(size_t size, bool commit, bool allow_large, bool exclusive, mi_arena_id_t* arena_id) mi_attr_noexcept;
