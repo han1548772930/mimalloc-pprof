@@ -324,6 +324,25 @@ int mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_
   // E. one final arena pass so the pages the sweeps freed leave now, not at the next purge_delay
   mi_purge_all_arenas(force);
 
+  // F. release the arenas of every sub-process that are COMPLETELY free -- metadata
+  //    included; without this flag nothing in the library ever gives an arena back before
+  //    process exit (`mi_arenas_unsafe_destroy` is not reachable from a live process). This
+  //    needs far more than the walk above: every registered thread of the sub-process must be
+  //    OUT of the allocator at one and the same instant, because an arena's bitmaps and its
+  //    slot in `subproc->arenas[]` are lock-free state that any allocation can reach. So the
+  //    reclaim claims every claimable tld at once, holds the two locks that close the
+  //    bootstrap and scavenger doors, and reports -- never waits on a lock it holds -- a
+  //    sub-process where that fails (it retries within `wait_ms` for a thread that is merely
+  //    between two calls; src/arena-reclaim.c spells the argument out). Our own tld is
+  //    excluded from the claims, which is why the gate is entered here too: an owner-gated
+  //    thread is inside the allocator, so the scavenger cannot claim US while we free arenas.
+  mi_arena_reclaim_report_t reclaim; _mi_memzero(&reclaim, sizeof(reclaim));
+  if ((flags & MI_PURGE_RECLAIM) != 0) {
+    MI_GATE_ENTER(my_theap);
+    _mi_arenas_reclaim_now(my_tld, wait_ms, &reclaim);
+    MI_GATE_LEAVE(my_tld);
+  }
+
   mi_purge_snapshot(&after);
   if (report != NULL) {
     const size_t hole_delta   = (after.hole_total >= before.hole_total ? after.hole_total - before.hole_total : 0);
@@ -336,6 +355,13 @@ int mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_
     report->theaps_orphaned = walk.orphaned;
     report->gated           = (MI_OWNER_GATE != 0);
     report->complete        = (walk.pending == 0 && walk.orphaned == 0);
+    report->arenas_reclaimed    = reclaim.arenas_reclaimed;
+    report->arena_reclaim_bytes = reclaim.reclaim_bytes;
+    report->arenas_kept         = reclaim.arenas_kept;
+    report->subprocs_pending    = reclaim.subprocs_pending;
+    report->reclaimed           = ((flags & MI_PURGE_RECLAIM) != 0 &&
+                                   reclaim.subprocs_pending == 0 &&
+                                   !reclaim.layer_busy);
   }
   const int status = (walk.pending == 0 ? MI_PURGE_OK : MI_PURGE_PARTIAL);
 
