@@ -156,14 +156,14 @@ arenas it deliberately does **not** release (an `exclusive` reservation whose
 
 ```c
 #include <mimalloc.h>
+#include <stdio.h>
 
 /* From an idle point: hand back the arenas the peak left behind. Best effort by
    construction -- re-run it later if `reclaimed` is false. */
-static size_t reclaim_at_idle(void) {
-  mi_purge_all_report_t r;
-  mi_purge_all_ex((mi_purge_flags_t)(MI_PURGE_FORCE | MI_PURGE_RECLAIM), 100, &r);
-  return r.arenas_reclaimed;
-}
+mi_purge_all_report_t r;
+mi_purge_all_ex((mi_purge_flags_t)(MI_PURGE_FORCE | MI_PURGE_RECLAIM), 100, &r);
+printf("reclaim ran: %d; %zu arenas / %zu MiB of address space went back\n",
+       (int)r.reclaimed, r.arenas_reclaimed, r.arena_reclaim_bytes / (1024 * 1024));
 ```
 
 Without the flag the behaviour is exactly the behaviour before this flag: nothing is ever

@@ -172,16 +172,20 @@ hand their theaps over (`mi_on_thread_idle_start`):
 
 ```c
 #include <mimalloc.h>
+#include <stdio.h>
 
 /* Give back the arenas the peak left behind. Best effort by construction: a caller that
-   cares re-checks the report (and may run this again later). Returns the bytes returned
-   to the OS, or 0 when another purge was in flight. */
-static size_t reclaim_free_arenas(void) {
-  mi_purge_all_report_t r;
-  const int status = mi_purge_all_ex((mi_purge_flags_t)(MI_PURGE_FORCE | MI_PURGE_RECLAIM),
-                                     100, &r);
-  if (status == MI_PURGE_BUSY) { return 0; }   /* nothing was done */
-  return r.arena_reclaim_bytes;
+   cares re-checks the report and may run this again later -- `reclaimed` is false when
+   another purge was in flight (`status == MI_PURGE_BUSY`) or a sub-process could not be
+   claimed. */
+mi_purge_all_report_t r;
+const int status = mi_purge_all_ex((mi_purge_flags_t)(MI_PURGE_FORCE | MI_PURGE_RECLAIM),
+                                   100, &r);
+if (status == MI_PURGE_BUSY) {
+  printf("another purge was in flight: nothing was done\n");
+} else {
+  printf("%zu arenas, %zu MiB of address space back; %zu sub-processes pending\n",
+         r.arenas_reclaimed, r.arena_reclaim_bytes / (1024 * 1024), r.subprocs_pending);
 }
 ```
 
