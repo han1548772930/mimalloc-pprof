@@ -15,6 +15,8 @@ from unittest.mock import patch
 from ci import release
 
 SHA = "a" * 40
+BUMP = "b" * 40
+PARENT = "c" * 40
 
 
 class ReleaseFrontdoorTests(unittest.TestCase):
@@ -178,40 +180,36 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.recorded_version_bump_pr("- Version-bump PR: pending")
 
-    def test_candidate_accepts_recorded_squash_merge_and_rejects_other_pr(self) -> None:
+    def test_candidate_accepts_later_reviewed_merge_and_rejects_other_pr(self) -> None:
         value = release.directive(444, "1.0.1", SHA)
-        parent = "b" * 40
         responses = {
             "issue": json.dumps(
                 {
                     "state": "OPEN",
                     "title": "release v1.0.1",
-                    "body": f"- Candidate merge SHA: **{SHA}**\n- Version-bump PR: #999",
-                }
-            ),
-            "pr": json.dumps(
-                {
-                    "baseRefName": "main",
-                    "mergedAt": "2026-09-23T00:00:00Z",
-                    "mergeCommit": {"oid": SHA},
+                    "body": f"- Candidate merge SHA: **{SHA}**\n- Candidate PR: #1000\n- Version-bump merge SHA: **{BUMP}**\n- Version-bump PR: #999",
                 }
             ),
             "HEAD": SHA,
-            "parents": f"{SHA} {parent}",
+            "parents": f"{BUMP} {PARENT}",
             "previous": '[package]\nversion = "1.0.0"\n',
+            "bumped": '[package]\nversion = "1.0.1"\n',
         }
 
         def fake_command(*args: str) -> str:
             if args[:3] == ("gh", "issue", "view"):
                 return responses["issue"]
             if args[:3] == ("gh", "pr", "view"):
-                return responses["pr"]
+                oid = BUMP if args[3] == "999" else SHA
+                return json.dumps(
+                    {"baseRefName": "main", "mergedAt": "now", "mergeCommit": {"oid": oid}}
+                )
             if args[:3] == ("git", "rev-parse", "HEAD"):
                 return responses["HEAD"]
             if args[:3] == ("git", "rev-list", "--parents"):
                 return responses["parents"]
             if args[:2] == ("git", "show"):
-                return responses["previous"]
+                return responses["previous"] if args[2].startswith(PARENT) else responses["bumped"]
             return ""
 
         with (
@@ -221,11 +219,94 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         ):
             run.return_value.returncode = 0
             release.validate_candidate(value, require_registry_free=False)
-            responses["pr"] = json.dumps(
-                {"baseRefName": "main", "mergedAt": "now", "mergeCommit": {"oid": parent}}
-            )
-            with self.assertRaisesRegex(release.ReleaseError, "recorded PR"):
+            responses["issue"] = responses["issue"].replace("#1000", "#999")
+            with self.assertRaisesRegex(release.ReleaseError, "candidate differs"):
                 release.validate_candidate(value, require_registry_free=False)
+
+    def test_prewrite_retarget_and_postwrite_freeze(self) -> None:
+        old = release.directive(444, "1.0.1", BUMP)
+        new = release.directive(444, "1.0.1", SHA)
+        release.require_history([old, new], new, None)
+        info = {**new, "artifacts": [{"name": name, "sha256": "d" * 64} for name in new["assets"]]}
+        frozen = release.freeze_record(new, info, "f" * 64)
+        release.require_history([old, new], new, frozen)
+        release.require_frozen_info(frozen, new, info)
+        with self.assertRaisesRegex(release.ReleaseError, "frozen"):
+            release.require_history([old, new], old, frozen)
+        info["artifacts"][0]["sha256"] = "e" * 64
+        with self.assertRaisesRegex(release.ReleaseError, "frozen"):
+            release.require_frozen_info(frozen, new, info)
+
+    def test_partial_github_assets_resume_and_conflict(self) -> None:
+        value = release.directive(444, "1.0.1", SHA)
+        info = {
+            **value,
+            "artifacts": [{"name": name, "sha256": "d" * 64} for name in value["assets"]],
+        }
+        frozen = release.freeze_record(value, info, "f" * 64)
+        existing: dict[str, object] = {
+            "tag_name": value["tag"],
+            "target_commitish": SHA,
+            "assets": [{"name": value["assets"][0], "digest": "sha256:" + "d" * 64}],
+        }
+        with patch.object(release, "command", return_value=json.dumps([existing])):
+            release.verify_existing_release_assets(value, frozen)
+            existing["assets"] = [{"name": value["assets"][0], "digest": "sha256:" + "e" * 64}]
+            with (
+                patch.object(release, "command", return_value=json.dumps([existing])),
+                self.assertRaisesRegex(release.ReleaseError, "frozen hash"),
+            ):
+                release.verify_existing_release_assets(value, frozen)
+
+    def test_existing_tag_requires_frozen_same_sha(self) -> None:
+        value = release.directive(444, "1.0.1", SHA)
+        issue = json.dumps(
+            {
+                "state": "OPEN",
+                "title": "release v1.0.1",
+                "body": f"- Candidate merge SHA: **{SHA}**\n- Candidate PR: #1000\n- Version-bump merge SHA: **{BUMP}**\n- Version-bump PR: #999",
+            }
+        )
+        tag_target = SHA
+
+        def fake_command(*args: str) -> str:
+            if args[:3] == ("gh", "issue", "view"):
+                return issue
+            if args[:3] == ("gh", "pr", "view"):
+                oid = BUMP if args[3] == "999" else SHA
+                return json.dumps(
+                    {"baseRefName": "main", "mergedAt": "now", "mergeCommit": {"oid": oid}}
+                )
+            if args[:3] == ("git", "rev-parse", "HEAD"):
+                return SHA
+            if args[:3] == ("git", "rev-list", "--parents"):
+                return f"{BUMP} {PARENT}"
+            if args[:2] == ("git", "show"):
+                return (
+                    '[package]\nversion = "1.0.0"\n'
+                    if args[2].startswith(PARENT)
+                    else '[package]\nversion = "1.0.1"\n'
+                )
+            if args[:3] == ("git", "ls-remote", "--tags"):
+                return f"{tag_target}\t{args[-1]}"
+            return ""
+
+        with (
+            patch.object(release, "command", side_effect=fake_command),
+            patch.object(release, "source_version", return_value="1.0.1"),
+            patch.object(release.subprocess, "run") as run,
+        ):
+            run.return_value.returncode = 0
+            with self.assertRaisesRegex(release.ReleaseError, "without frozen"):
+                release.validate_candidate(value, require_registry_free=False)
+            release.validate_candidate(
+                value, require_registry_free=False, frozen={"directive": value}
+            )
+            tag_target = PARENT
+            with self.assertRaisesRegex(release.ReleaseError, "different commit"):
+                release.validate_candidate(
+                    value, require_registry_free=False, frozen={"directive": value}
+                )
 
     def test_comment_round_trip_and_dry_run_has_no_worker_dispatch(self) -> None:
         directive = release.directive(444, "1.0.1", SHA)
@@ -239,6 +320,7 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             ),
             patch.object(release, "source_version", return_value="1.0.1"),
             patch.object(release, "issue_directives", return_value=[]),
+            patch.object(release, "frozen_identity", return_value=None),
             patch.object(release, "validate_candidate"),
             patch.object(release, "command") as run,
         ):

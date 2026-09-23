@@ -6,12 +6,18 @@ every required cell in `ci/release_full_ci_manifest.v1.json`, all at the exact
 merged candidate SHA. Native hosted macOS Intel and Apple Silicon are allowed
 for this opt-in full/release validation.
 
-Before starting a candidate, update the control issue body with exactly one
-`- Version-bump PR: #<number>` line and one
-`- Candidate merge SHA: **<full lowercase SHA>**` line. The front door verifies
-that GitHub records the PR as merged to `main` at that SHA and that the resulting
-commit changes the package version from its first parent. Squash and ordinary
-merge results are both accepted; an absent or conflicting record fails closed.
+Before starting a candidate, update the control issue body with exactly one each
+of `- Version-bump PR: #<number>`, `- Version-bump merge SHA: **<full SHA>**`,
+`- Candidate PR: #<number>`, and `- Candidate merge SHA: **<full SHA>**`.
+The bump PR must have merged to `main` and changed the package version from its
+first parent. The candidate PR must also have merged to `main`; its commit must
+descend from the bump and retain the requested source and lockfile version.
+The candidate can move to a later reviewed merge while publication has not begun.
+After the first external publication write, record a `fleet-release-freeze/v1`
+issue comment containing the exact directive, `info.json` digest, five asset
+SHA-256 values, and the packaged `.crate` SHA-256. Resume then requires that same identity, accepts an existing tag
+only when it resolves to the frozen candidate, and rejects conflicting existing
+GitHub asset hashes and crates.io checksum. Missing declared outputs may be filled on resume.
 
 `ci/release.py` is the attempt front door. Issue #444 is the live control record
 for the v1.0.1 pilot. After a reviewed version bump is merged to `main`, use a
@@ -42,14 +48,10 @@ destinations are verified; verify that `v1.0.1` resolves to the candidate SHA.
 Crates.io and GitHub cannot be one atomic transaction, so a partial result must
 stay recorded on the issue and resume without changing identity.
 
-Two additional gates must be closed before the real publisher is enabled:
-
-- The front door currently proves that the candidate is an ancestor of `main`
-  and has the requested version. It must also prove that this SHA is the
-  intended, reviewed version-bump merge commit recorded by the release issue;
-  an arbitrary older main commit with the same version is insufficient.
-- The remaining release state machine must preserve each archive's validated
-  identity and hashes across retries, and verify final registry destinations.
+The remaining publisher state machine must create the freeze record before its
+first tag, registry, or release write, preserve each archive's validated hashes
+across retries, and verify final registry destinations. The real publisher is
+still disabled by its explicit failing gate.
 
 The archive inspection gate now checks the C ZIP against candidate vendor files,
 checks binary archive `PROVENANCE.txt` commit/target fields, and checks the

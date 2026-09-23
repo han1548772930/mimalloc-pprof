@@ -25,6 +25,7 @@ from typing import Any, cast
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "zackees/mimalloc-pprof"
 MARKER = "<!-- fleet-release-attempt/v1 -->"
+FREEZE_MARKER = "<!-- fleet-release-freeze/v1 -->"
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 MAX_ASSET_BYTES = 100_000_000
 ASSET_TEMPLATES = (
@@ -143,6 +144,115 @@ def issue_directives(issue: int) -> list[dict[str, Any]]:
     return [parsed for body in issue_comments(issue) if (parsed := parse_directive(body))]
 
 
+def frozen_identity(issue: int) -> dict[str, Any] | None:
+    records: list[dict[str, Any]] = []
+    for body in issue_comments(issue):
+        if FREEZE_MARKER in body:
+            match = re.search(r"```json\n(.*?)\n```", body, re.DOTALL)
+            if not match:
+                raise ReleaseError("release freeze has no JSON")
+            record: object = json.loads(match.group(1))
+            if not isinstance(record, dict):
+                raise ReleaseError("invalid release freeze")
+            typed_record = cast(dict[str, Any], record)
+            if typed_record.get("schema") != "fleet-release-freeze/v1":
+                raise ReleaseError("invalid release freeze")
+            records.append(typed_record)
+    if records and any(record != records[0] for record in records):
+        raise ReleaseError("conflicting frozen release identities")
+    return records[0] if records else None
+
+
+def require_history(
+    records: list[dict[str, Any]], desired: dict[str, Any], frozen: dict[str, Any] | None
+) -> None:
+    for record in records:
+        if {key: item for key, item in record.items() if key != "candidate_sha"} != {
+            key: item for key, item in desired.items() if key != "candidate_sha"
+        }:
+            raise ReleaseError("release scope changed across issue directives")
+    if frozen is not None:
+        if frozen.get("directive") != desired:
+            raise ReleaseError("release identity is frozen at a different candidate")
+        if not records or records[-1] != desired:
+            raise ReleaseError("issue retargeted after release identity froze")
+
+
+def freeze_record(value: dict[str, Any], info: dict[str, Any], crate_sha256: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{64}", crate_sha256):
+        raise ReleaseError("freeze requires packaged crate SHA-256")
+    if {key: info.get(key) for key in value} != value:
+        raise ReleaseError("info.json does not match release directive")
+    artifacts: object = info.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ReleaseError("freeze requires all declared assets")
+    rows = cast(list[dict[str, Any]], artifacts)
+    if [row.get("name") for row in rows] != value["assets"]:
+        raise ReleaseError("freeze requires all declared assets")
+    hashes = {str(row["name"]): row.get("sha256") for row in rows}
+    if any(
+        not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        for digest in hashes.values()
+    ):
+        raise ReleaseError("freeze requires valid asset SHA-256 hashes")
+    return {
+        "schema": "fleet-release-freeze/v1",
+        "directive": value,
+        "info_sha256": hashlib.sha256(
+            json.dumps(info, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "asset_sha256": hashes,
+        "crate_sha256": crate_sha256,
+    }
+
+
+def require_frozen_info(
+    frozen: dict[str, Any], value: dict[str, Any], info: dict[str, Any]
+) -> None:
+    if frozen != freeze_record(value, info, frozen.get("crate_sha256", "")):
+        raise ReleaseError("release assets differ from frozen info.json")
+
+
+def verify_existing_release_assets(value: dict[str, Any], frozen: dict[str, Any]) -> None:
+    """Reject conflicting destination bytes while allowing absent outputs on resume."""
+    raw = command("gh", "api", f"repos/{REPO}/releases?per_page=100")
+    releases: list[dict[str, Any]] = json.loads(raw)
+    matches = [row for row in releases if row.get("tag_name") == value["tag"]]
+    if len(matches) > 1:
+        raise ReleaseError("duplicate GitHub Releases for tag")
+    if not matches:
+        return
+    release = matches[0]
+    if release.get("target_commitish") not in (value["candidate_sha"], value["tag"]):
+        raise ReleaseError("existing GitHub Release has conflicting identity")
+    declared = frozen["asset_sha256"]
+    for asset in release.get("assets", []):
+        name = asset.get("name")
+        if name not in declared:
+            raise ReleaseError(f"unexpected existing release asset {name}")
+        if asset.get("digest") != f"sha256:{declared[name]}":
+            raise ReleaseError(f"existing release asset {name} differs from frozen hash")
+
+
+def verify_existing_crate(value: dict[str, Any], frozen: dict[str, Any]) -> None:
+    import urllib.error
+    import urllib.request
+
+    url = f"https://crates.io/api/v1/crates/mimalloc-pprof/{value['version']}"
+    request = urllib.request.Request(url, headers={"User-Agent": "mimalloc-pprof release resume"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return
+        raise ReleaseError(f"crates.io version check returned HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise ReleaseError(f"crates.io version check failed: {error}") from error
+    if result.get("version", {}).get("checksum") != frozen.get("crate_sha256"):
+        raise ReleaseError("existing crates.io package differs from frozen crate hash")
+
+
 def recorded_merge_sha(body: str) -> str:
     matches = re.findall(
         r"(?im)^- Candidate merge SHA:\s*(?:`|\*\*)?([0-9a-f]{40})(?:`|\*\*)?\s*$", body
@@ -159,7 +269,64 @@ def recorded_version_bump_pr(body: str) -> int:
     return int(matches[0])
 
 
-def validate_candidate(value: dict[str, Any], *, require_registry_free: bool = True) -> None:
+def recorded_version_bump_sha(body: str) -> str:
+    matches = re.findall(
+        r"(?im)^- Version-bump merge SHA:\s*(?:`|\*\*)?([0-9a-f]{40})(?:`|\*\*)?\s*$", body
+    )
+    if len(matches) != 1:
+        raise ReleaseError("release issue must record one full Version-bump merge SHA")
+    return matches[0]
+
+
+def recorded_candidate_pr(body: str) -> int:
+    matches = re.findall(r"(?im)^- Candidate PR:\s*#([1-9][0-9]*)\s*$", body)
+    if len(matches) != 1:
+        raise ReleaseError("release issue must record one Candidate PR number")
+    return int(matches[0])
+
+
+def merged_pr_sha(number: int) -> str:
+    pr = json.loads(
+        command(
+            "gh",
+            "pr",
+            "view",
+            str(number),
+            "-R",
+            REPO,
+            "--json",
+            "baseRefName,mergedAt,mergeCommit",
+        )
+    )
+    sha = pr.get("mergeCommit", {}).get("oid")
+    if (
+        pr.get("baseRefName") != "main"
+        or not pr.get("mergedAt")
+        or not isinstance(sha, str)
+        or not SHA_RE.fullmatch(sha)
+    ):
+        raise ReleaseError(f"PR #{number} is not a reviewed merged commit on main")
+    return sha
+
+
+def is_ancestor(older: str, newer: str) -> bool:
+    return (
+        subprocess.run(
+            ("git", "merge-base", "--is-ancestor", older, newer),
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def validate_candidate(
+    value: dict[str, Any],
+    *,
+    require_registry_free: bool = True,
+    frozen: dict[str, Any] | None = None,
+) -> None:
     expected = directive(value["issue"], value["version"], value["candidate_sha"])
     require_same_directive(expected, value)
     issue = json.loads(
@@ -169,53 +336,46 @@ def validate_candidate(value: dict[str, Any], *, require_registry_free: bool = T
     )
     if issue.get("state") != "OPEN" or f"v{value['version']}" not in issue.get("title", ""):
         raise ReleaseError("release issue is closed or targets a different version")
-    if recorded_merge_sha(issue.get("body", "")) != value["candidate_sha"]:
-        raise ReleaseError("candidate differs from the issue's reviewed version-bump merge SHA")
-    pr_number = recorded_version_bump_pr(issue["body"])
-    pr = json.loads(
-        command(
-            "gh",
-            "pr",
-            "view",
-            str(pr_number),
-            "-R",
-            REPO,
-            "--json",
-            "baseRefName,mergedAt,mergeCommit",
-        )
-    )
-    if (
-        pr.get("baseRefName") != "main"
-        or not pr.get("mergedAt")
-        or pr.get("mergeCommit", {}).get("oid") != value["candidate_sha"]
-    ):
-        raise ReleaseError("candidate is not the recorded PR's merged commit on main")
+    body = issue.get("body", "")
+    bump = recorded_version_bump_sha(body)
+    if merged_pr_sha(recorded_version_bump_pr(body)) != bump:
+        raise ReleaseError("version bump differs from its recorded PR merge")
+    if recorded_merge_sha(body) != value["candidate_sha"]:
+        raise ReleaseError("candidate differs from issue control")
+    if merged_pr_sha(recorded_candidate_pr(body)) != value["candidate_sha"]:
+        raise ReleaseError("candidate differs from its recorded PR merge")
     if source_version() != value["version"]:
         raise ReleaseError("source Cargo version differs from the release directive")
     head = command("git", "rev-parse", "HEAD")
     if head != value["candidate_sha"]:
         raise ReleaseError("checkout HEAD differs from release candidate SHA")
-    parents = command("git", "rev-list", "--parents", "-n", "1", head).split()
-    if len(parents) not in (2, 3) or parents[0] != head:
-        raise ReleaseError("candidate is not a version-bump merge result")
+    command("git", "fetch", "origin", "main")
+    if not is_ancestor(bump, head) or not is_ancestor(head, "origin/main"):
+        raise ReleaseError("candidate must descend from the bump and be merged into main")
+    parents = command("git", "rev-list", "--parents", "-n", "1", bump).split()
+    if len(parents) not in (2, 3) or parents[0] != bump:
+        raise ReleaseError("version bump is not a merge result")
     previous = command("git", "show", f"{parents[1]}:rust/mimalloc-pprof/Cargo.toml")
     previous_version = re.search(r'(?m)^version\s*=\s*"([^"]+)"', previous)
     if not previous_version or previous_version.group(1) == value["version"]:
-        raise ReleaseError("candidate merge did not bump the version from its first parent")
-    command("git", "fetch", "origin", "main")
-    if subprocess.run(
-        ("git", "merge-base", "--is-ancestor", head, "origin/main"),
-        cwd=ROOT,
-        capture_output=True,
-        check=False,
-    ).returncode:
-        raise ReleaseError("candidate is not merged into main")
+        raise ReleaseError("recorded bump did not change the version from its first parent")
+    bumped = command("git", "show", f"{bump}:rust/mimalloc-pprof/Cargo.toml")
+    bumped_version = re.search(r'(?m)^version\s*=\s*"([^"]+)"', bumped)
+    if not bumped_version or bumped_version.group(1) != value["version"]:
+        raise ReleaseError("recorded bump has the wrong version")
     if command("git", "status", "--porcelain"):
         raise ReleaseError("release candidate checkout must be clean")
     existing_tag = command("git", "ls-remote", "--tags", "origin", f"refs/tags/{value['tag']}")
     if existing_tag:
-        raise ReleaseError(f"tag {value['tag']} already exists")
-    if require_registry_free:
+        if frozen is None:
+            raise ReleaseError(f"tag {value['tag']} already exists without frozen identity")
+        tag_sha = command("git", "ls-remote", "--tags", "origin", f"refs/tags/{value['tag']}^{{}}")
+        resolved = tag_sha.split()[0] if tag_sha else existing_tag.split()[0]
+        if resolved != head:
+            raise ReleaseError(f"tag {value['tag']} points to a different commit")
+    if frozen is not None and frozen.get("directive") != value:
+        raise ReleaseError("frozen release identity differs from directive")
+    if require_registry_free and frozen is None:
         # gh api cannot query crates.io. urllib returns HTTP 404 for an unused version.
         import urllib.error
         import urllib.request
@@ -450,21 +610,23 @@ def main() -> int:
             existing = issue_directives(args.issue)
             if not existing:
                 raise ReleaseError("issue has no release directive")
-            for record in existing:
-                require_same_directive(record, value)
+            frozen = frozen_identity(args.issue)
+            require_history(existing, value, frozen)
             info = inspect_artifacts(args.dist, value)
+            if frozen is not None:
+                require_frozen_info(frozen, value, info)
             (args.dist / "info.json").write_text(json.dumps(info, indent=2, sort_keys=True) + "\n")
             verify_info(args.dist, value, info)
             print(json.dumps(info, indent=2))
             return 0
         existing = issue_directives(args.issue)
+        frozen = frozen_identity(args.issue)
         if args.operation == "start" and existing:
             raise ReleaseError("attempt already exists; use resume")
         if args.operation in ("resume", "worker-check", "record-outcome"):
             if not existing:
                 raise ReleaseError("attempt issue has no directive; use start")
-            for record in existing:
-                require_same_directive(record, value)
+            require_history(existing, value, frozen)
         if args.operation == "record-outcome":
             state = f"{args.state}; jobs: {args.results}"
             command(
@@ -479,7 +641,10 @@ def main() -> int:
             )
             print(state)
             return 0
-        validate_candidate(value)
+        validate_candidate(value, frozen=frozen)
+        if frozen is not None:
+            verify_existing_release_assets(value, frozen)
+            verify_existing_crate(value, frozen)
         if args.operation == "worker-check":
             print(f"validated release issue #{args.issue} at {candidate}")
             return 0
