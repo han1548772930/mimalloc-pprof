@@ -261,8 +261,15 @@ static bool mi_arena_reclaim_one(mi_subproc_t* subproc, size_t idx, mi_arena_t* 
   const size_t guard_bytes = (memid.is_pinned ? 0 : _mi_os_secure_guard_page_size());
   size_t committed_bytes;
   if (memid.initially_committed && _mi_os_has_overcommit()) {
-    committed_bytes = mi_size_of_slices(mi_bitmap_popcountN(arena->slices_dirty, arena->info_slices,
-                                                             arena->slice_count - arena->info_slices));
+    // Dirty bits survive a real decommit (notably Unix Debug's PROT_NONE path).
+    // That path already debited committed; only still-committed slices remain ours to debit.
+    size_t committed_slices = 0;
+    for (size_t i = arena->info_slices; i < arena->slice_count; i++) {
+      if (mi_bitmap_is_set(arena->slices_dirty, i) && mi_bitmap_is_set(arena->slices_committed, i)) {
+        committed_slices++;
+      }
+    }
+    committed_bytes = mi_size_of_slices(committed_slices);
   }
   else {
     committed_bytes = mi_size_of_slices(mi_bitmap_popcountN(arena->slices_committed, 0, arena->slice_count));

@@ -98,9 +98,10 @@ A release moves two statistics by different amounts. `reserved` falls by exactly
 on Windows the 1 GiB arena above carries ~2.8 MiB of committed metadata — its info block — and no
 committed data once the peak has been purged, and `committed` is the number a host actually
 watches. That debit is read from the same record the arena layer credits from (`src/arena.c`):
-the arena's commit bits, or `slices_dirty` on an overcommitting OS, where `mi_arena_reserve`
+the arena's commit bits, or `slices_dirty & slices_committed` on an overcommitting OS, where `mi_arena_reserve`
 cancels the reservation's credit again at reserve time and the slices are counted as they are
-first handed out. `mi_arenas_unsafe_destroy` passes `still_committed = true` because it runs at
+first handed out. A real decommit (including Unix Debug's `PROT_NONE` path) already debits
+those slices, even though their dirty bits remain set. `mi_arenas_unsafe_destroy` passes `still_committed = true` because it runs at
 process exit; a live process must not, since the whole reservation would be debited on top of
 that and `committed` would be walked below zero.
 

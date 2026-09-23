@@ -233,6 +233,8 @@ static void run_reclaim_rows(void) {
 
   // A4: free what is left and reclaim again -- after that, the metadata of the peak is gone.
   mi_free(big[0]); mi_free(big[2]);
+  mi_purge_all(true);  // debit any real decommit before measuring the arena-only release
+  const int64_t committed_before2 = committed_stat();
   const mi_purge_all_report_t rep2 = reclaim_all();
   const arena_accounting_t after2 = accounting();
   const int64_t committed_after2 = committed_stat();
@@ -243,6 +245,8 @@ static void run_reclaim_rows(void) {
   check(after2.meta < first.meta, "A4: the peak's metadata is gone -- only what is still live is accounted for");
   check(after2.reserved <= small.reserved, "A4: the peak's address space is gone too (only what the small object needed may stay)");
   check(committed_after2 > 0, "A4: `committed` stayed positive across the second release too");
+  check(committed_before2 - committed_after2 <= (int64_t)(after.meta - after2.meta),
+        "A4: reclaim does not debit data slices already decommitted");
   mi_free(keep_small);
 }
 
