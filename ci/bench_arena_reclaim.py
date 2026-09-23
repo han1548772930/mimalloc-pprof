@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import platform
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA = ROOT / ".github/assets/arena-reclaim-results.json"
 MODES = ("purge-only", "reclaim")
 SCENARIOS = ("empty", "nonempty", "retained-id")
+THREAD_STATES = ("none", "idle", "active")
 PHASES = ("baseline", "peak", "free", "purge", "reclaim", "peak", "free", "purge", "reclaim")
 METRICS = (
     "rss_bytes",
@@ -86,7 +88,9 @@ def build(root: Path, owner_gate: bool, toolchain: str) -> tuple[Path, list[str]
     return executables[0], flags
 
 
-def validate_samples(samples: list[dict[str, Any]], mode: str, scenario: str) -> None:
+def validate_samples(
+    samples: list[dict[str, Any]], mode: str, scenario: str, thread_state: str
+) -> None:
     if tuple(s["phase"] for s in samples) != PHASES or tuple(s["wave"] for s in samples) != (
         0,
         1,
@@ -105,25 +109,50 @@ def validate_samples(samples: list[dict[str, Any]], mode: str, scenario: str) ->
                 raise ValueError(f"missing or invalid {metric}")
         if sample["reclaim_requested"] and sample["phase"] != "reclaim":
             raise ValueError("reclaim flag reported outside reclaim phase")
+        if not sample["reclaim_requested"] and sample.get("reclaim_result") != "not-requested":
+            raise ValueError("unexpected result for unrequested reclaim")
     reclaim_rows = (samples[4], samples[8])
     for row in reclaim_rows:
         if row["reclaim_requested"] != (mode == "reclaim"):
             raise ValueError("missing reclaim/no-op marker")
         if not isinstance(row["reclaim_pass_ran"], bool):
             raise ValueError("missing reclaim-pass marker")
+        result = row.get("reclaim_result")
+        expected_result = (
+            "not-requested"
+            if mode == "purge-only"
+            else "purge-busy"
+            if row["purge_status"] == 2
+            else "pending-subprocess"
+            if not row["reclaim_pass_ran"] and row["subprocs_pending"] > 0
+            else "arena-layer-busy"
+            if not row["reclaim_pass_ran"]
+            else "released"
+            if row["arenas_reclaimed"] > 0
+            else "no-eligible-arena"
+        )
+        if result != expected_result:
+            raise ValueError(f"missing or inconsistent reclaim/no-op reason: {result!r}")
         if mode == "purge-only" and (row["reclaim_pass_ran"] or row["arena_reclaim_bytes"]):
             raise ValueError("purge-only control reports reclamation")
         if row["arena_reclaim_bytes"] > 0 and not row["reclaim_pass_ran"]:
             raise ValueError("reclaimed bytes without a completed pass")
         if scenario == "nonempty" and row["arenas_reclaimed"] > 0:
             raise ValueError("nonempty control released a live arena")
-        if scenario == "retained-id" and mode == "reclaim" and row["arenas_kept"] < 1:
+        if (
+            scenario == "retained-id"
+            and mode == "reclaim"
+            and row["reclaim_pass_ran"]
+            and row["arenas_kept"] < 1
+        ):
             raise ValueError("caller-reserved arena was not reported kept")
     if scenario == "retained-id" and any(
         s.get("retained_id_checked") is not True or s.get("retained_id_valid") is not True
         for s in samples
     ):
         raise ValueError("retained arena ID did not survive the pass")
+    if any(s.get("worker_started") is not (thread_state != "none") for s in samples):
+        raise ValueError("worker state did not match the requested condition")
 
 
 def measure(
@@ -137,14 +166,22 @@ def measure(
         "source_sha": sha,
         "benchmark_source_sha256": {
             name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-            for name in ("ci/bench_arena_reclaim.c", "ci/bench_arena_reclaim.py")
+            for name in (
+                "ci/bench_arena_reclaim.c",
+                "ci/bench_arena_reclaim.py",
+                "ci/arena_reclaim_bench/CMakeLists.txt",
+            )
         },
         "host": {
             "platform": platform.platform(),
             "node": platform.node(),
             "processor": platform.processor(),
+            "machine": platform.machine(),
+            "release": platform.release(),
             "python": sys.version.split()[0],
             "toolchain": toolchain,
+            "runner_os": os.environ.get("RUNNER_OS", "local"),
+            "runner_name": os.environ.get("RUNNER_NAME", "local"),
         },
         "workload": {
             "big_objects": 8,
@@ -154,67 +191,98 @@ def measure(
             "touch_stride_bytes": 4096,
             "arena_reserve_kib": 32 * 1024,
         },
-        "selection_rule": "median paired difference across all raw repetitions; no runs excluded",
+        "selection_rule": "per-phase arm medians; tradeoffs use median paired per-repeat deltas; no runs excluded",
         "records": [],
     }
     for owner_gate in (False, True):
         exe, flags = build(build_root, owner_gate, toolchain)
         for decommit in decommits:
             for scenario in SCENARIOS:
-                for repeat in range(runs):
-                    # Alternate order to reduce systematic cache/temperature bias.
-                    modes = MODES if repeat % 2 == 0 else MODES[::-1]
-                    for mode in modes:
-                        env = os.environ.copy()
-                        env["MIMALLOC_PURGE_DECOMMITS"] = decommit
-                        child = subprocess.run(
-                            [str(exe), mode, scenario],
-                            cwd=ROOT,
-                            env=env,
-                            text=True,
-                            capture_output=True,
-                        )
-                        if child.returncode:
-                            raise RuntimeError(
-                                f"{exe} {mode} {scenario} failed ({child.returncode})\n{child.stdout}\n{child.stderr}"
+                for thread_state in THREAD_STATES:
+                    for repeat in range(runs):
+                        # Alternate order to reduce systematic cache/temperature bias.
+                        modes = MODES if repeat % 2 == 0 else MODES[::-1]
+                        for mode in modes:
+                            env = os.environ.copy()
+                            env["MIMALLOC_PURGE_DECOMMITS"] = decommit
+                            command = [str(exe), mode, scenario, thread_state]
+                            child = subprocess.run(
+                                command,
+                                cwd=ROOT,
+                                env=env,
+                                text=True,
+                                capture_output=True,
+                                timeout=180,
                             )
-                        output = child.stdout
-                        samples = [
-                            json.loads(line) for line in output.splitlines() if line.startswith("{")
-                        ]
-                        validate_samples(samples, mode, scenario)
-                        report["records"].append(
-                            {
-                                "owner_gate": owner_gate,
-                                "purge_decommits": decommit,
-                                "scenario": scenario,
-                                "repeat": repeat,
-                                "mode": mode,
-                                "cmake_flags": flags,
-                                "command": [str(exe), mode, scenario],
-                                "samples": samples,
-                            }
-                        )
+                            if child.returncode:
+                                raise RuntimeError(
+                                    f"{command!r} failed ({child.returncode})\n{child.stdout}\n{child.stderr}"
+                                )
+                            samples = [
+                                json.loads(line)
+                                for line in child.stdout.splitlines()
+                                if line.startswith("{")
+                            ]
+                            validate_samples(samples, mode, scenario, thread_state)
+                            report["records"].append(
+                                {
+                                    "owner_gate": owner_gate,
+                                    "purge_decommits": decommit,
+                                    "scenario": scenario,
+                                    "thread_state": thread_state,
+                                    "repeat": repeat,
+                                    "mode": mode,
+                                    "cmake_flags": flags,
+                                    "command": command,
+                                    "samples": samples,
+                                }
+                            )
     return report
 
 
 def validate_report(data: dict[str, Any]) -> None:
     if data.get("schema") != "arena-reclaim-v1" or not isinstance(data.get("records"), list):
         raise ValueError("invalid arena-reclaim data schema")
-    if len(data["records"]) < 12:
+    if len(data["records"]) < 3 * 2 * 2 * len(SCENARIOS) * len(THREAD_STATES) * len(MODES):
         raise ValueError("insufficient raw paired repetitions")
-    grouped: dict[tuple[bool, str, str, int], set[str]] = {}
+    grouped: dict[tuple[bool, str, str, str, int], set[str]] = {}
+    seen: set[tuple[bool, str, str, str, int, str]] = set()
+    repeats: set[int] = set()
     for record in data["records"]:
         mode, scenario = record["mode"], record["scenario"]
-        if mode not in MODES or scenario not in SCENARIOS:
+        thread_state = record["thread_state"]
+        if mode not in MODES or scenario not in SCENARIOS or thread_state not in THREAD_STATES:
             raise ValueError("unknown mode/scenario")
-        validate_samples(record["samples"], mode, scenario)
-        key = (record["owner_gate"], record["purge_decommits"], scenario, record["repeat"])
+        if type(record["owner_gate"]) is not bool or record["purge_decommits"] not in ("0", "1"):
+            raise ValueError("invalid owner-gate/decommit configuration")
+        if type(record["repeat"]) is not int or record["repeat"] < 0:
+            raise ValueError("invalid repeat index")
+        repeats.add(record["repeat"])
+        validate_samples(record["samples"], mode, scenario, thread_state)
+        if (
+            thread_state == "idle"
+            and not record["owner_gate"]
+            and not all(s.get("worker_parked") is True for s in record["samples"])
+        ):
+            raise ValueError("ungated idle worker did not park")
+        key = (
+            record["owner_gate"],
+            record["purge_decommits"],
+            scenario,
+            thread_state,
+            record["repeat"],
+        )
+        if (*key, mode) in seen:
+            raise ValueError("duplicate paired arm")
+        seen.add((*key, mode))
         grouped.setdefault(key, set()).add(mode)
     if any(modes != set(MODES) for modes in grouped.values()):
         raise ValueError("unpaired run")
-    if {record["scenario"] for record in data["records"]} != set(SCENARIOS):
-        raise ValueError("missing required empty/nonempty/retained-ID scenario")
+    if len(repeats) < 3 or repeats != set(range(len(repeats))):
+        raise ValueError("expected at least three consecutive raw repetitions")
+    expected = set(itertools.product((False, True), ("0", "1"), SCENARIOS, THREAD_STATES, repeats))
+    if set(grouped) != expected:
+        raise ValueError("missing owner-gate/decommit/scenario/thread/repetition arm")
 
 
 def svg(data: dict[str, Any], kind: str) -> str:
@@ -223,10 +291,51 @@ def svg(data: dict[str, Any], kind: str) -> str:
     records = [
         r
         for r in data["records"]
-        if not r["owner_gate"] and r["purge_decommits"] == "1" and r["scenario"] == "empty"
+        if not r["owner_gate"]
+        and r["purge_decommits"] == "1"
+        and r["scenario"] == "empty"
+        and r["thread_state"] == "none"
     ]
     if not records:
         raise ValueError("no default-build empty-arena series")
+    pairs: dict[int, dict[str, dict[str, Any]]] = {}
+    for record in records:
+        pairs.setdefault(record["repeat"], {})[record["mode"]] = record
+
+    def paired_difference(metric: str, phase_index: int) -> float:
+        return statistics.median(
+            float(pair["purge-only"]["samples"][phase_index][metric])
+            - float(pair["reclaim"]["samples"][phase_index][metric])
+            for pair in pairs.values()
+        )
+
+    def reclaim_median(metric: str, phase_index: int) -> float:
+        return statistics.median(
+            float(pair["reclaim"]["samples"][phase_index][metric]) for pair in pairs.values()
+        )
+
+    nonempty = [
+        r["samples"][4]
+        for r in data["records"]
+        if not r["owner_gate"]
+        and r["purge_decommits"] == "1"
+        and r["scenario"] == "nonempty"
+        and r["thread_state"] == "none"
+        and r["mode"] == "reclaim"
+    ]
+    active = [
+        r["samples"][4]
+        for r in data["records"]
+        if not r["owner_gate"]
+        and r["purge_decommits"] == "1"
+        and r["scenario"] == "empty"
+        and r["thread_state"] == "active"
+        and r["mode"] == "reclaim"
+    ]
+    no_op_note = (
+        f"Nonempty no-eligible: {sum(s['reclaim_result'] == 'no-eligible-arena' for s in nonempty)}/{len(nonempty)}; "
+        f"active-worker pending: {sum(s['reclaim_result'] == 'pending-subprocess' for s in active)}/{len(active)}."
+    )
     labels = [
         "baseline",
         "peak",
@@ -286,32 +395,35 @@ def svg(data: dict[str, Any], kind: str) -> str:
             '<text x="90" y="83" fill="#9a4a00" font-size="13" font-family="sans-serif">purge only</text><text x="200" y="83" fill="#075aa6" font-size="13" font-family="sans-serif">explicit reclaim</text>'
         )
         lines.append(
-            '<text x="36" y="448" font-size="12" font-family="sans-serif">RSS is physical; allocator-reserved virtual address space is NOT RSS. See docs/benchmarks.md.</text>'
+            '<text x="36" y="440" font-size="12" font-family="sans-serif">RSS is physical; allocator-reserved virtual address space is NOT RSS.</text>'
+        )
+        lines.append(
+            f'<text x="36" y="455" font-size="11" font-family="sans-serif">{escape(no_op_note)}</text>'
         )
     else:
-        reclaim = medians["reclaim"][4]
-        control = medians["purge-only"][4]
-        saved_rss = (control["rss_bytes"] - reclaim["rss_bytes"]) / 1048576
-        saved_private = (control["private_bytes"] - reclaim["private_bytes"]) / 1048576
-        reserved = reclaim["arena_reclaim_bytes"] / 1048576
+        saved_rss = paired_difference("rss_bytes", 4) / 1048576
+        saved_private = paired_difference("private_bytes", 4) / 1048576
+        saved_committed = paired_difference("allocator_committed_bytes", 4) / 1048576
+        reserved = reclaim_median("arena_reclaim_bytes", 4) / 1048576
+        regrowth_extra = -paired_difference("elapsed_ms", 5)
         costs = [
             ("Additional RSS reduction", f"{saved_rss:.1f} MiB", "#075aa6"),
             ("Additional private reduction", f"{saved_private:.1f} MiB", "#075aa6"),
+            ("Additional allocator commit reduction", f"{saved_committed:.1f} MiB", "#075aa6"),
             ("Virtual arena reservation released (not RSS)", f"{reserved:.0f} MiB", "#777"),
-            ("Reclaim call median", f"{reclaim['elapsed_ms']:.2f} ms", "#9a4a00"),
-            (
-                "Regrowth: reclaim / purge-only",
-                f"{medians['reclaim'][5]['elapsed_ms']:.1f} / {medians['purge-only'][5]['elapsed_ms']:.1f} ms",
-                "#9a4a00",
-            ),
+            ("Reclaim call median", f"{reclaim_median('elapsed_ms', 4):.2f} ms", "#9a4a00"),
+            ("Regrowth extra time vs paired control", f"{regrowth_extra:+.2f} ms", "#9a4a00"),
         ]
         for i, (label, value, color) in enumerate(costs):
-            y = 110 + i * 58
+            y = 100 + i * 48
             lines.append(
                 f'<text x="45" y="{y}" font-size="16" font-family="sans-serif">{label}</text><text x="780" y="{y}" fill="{color}" font-size="19" font-family="sans-serif">{value}</text>'
             )
         lines.append(
-            '<text x="36" y="430" font-size="12" font-family="sans-serif">Purge-only is the paired control; nonempty no-op and pending runs remain in raw data.</text>'
+            '<text x="36" y="410" font-size="12" font-family="sans-serif">All reductions are additional to ordinary purge; virtual reservation is not physical memory.</text>'
+        )
+        lines.append(
+            f'<text x="36" y="432" font-size="11" font-family="sans-serif">{escape(no_op_note)}</text>'
         )
     lines.append("</svg>")
     return "\n".join(lines) + "\n"

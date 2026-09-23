@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from bench_arena_reclaim import METRICS, PHASES, svg, validate_report
+from bench_arena_reclaim import METRICS, PHASES, THREAD_STATES, svg, validate_report
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "ci/bench_arena_reclaim.py"
@@ -17,42 +18,62 @@ SCRIPT = ROOT / "ci/bench_arena_reclaim.py"
 def fixture_data() -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     for scenario in ("empty", "nonempty", "retained-id"):
-        for repeat in range(3):
-            for mode in ("purge-only", "reclaim"):
-                samples: list[dict[str, Any]] = []
-                for i, phase in enumerate(PHASES):
-                    reclaimed = mode == "reclaim" and scenario == "empty" and phase == "reclaim"
-                    sample = {
-                        "phase": phase,
-                        "wave": 0 if i == 0 else 1 if i < 5 else 2,
-                        "elapsed_ms": 1.0,
-                        "reclaim_requested": mode == "reclaim" and phase == "reclaim",
-                        "reclaim_pass_ran": mode == "reclaim" and phase == "reclaim",
-                        "purge_status": 0,
-                        "arenas_reclaimed": 1 if reclaimed else 0,
-                        "arena_reclaim_bytes": 100 * 1048576 if reclaimed else 0,
-                        "arenas_kept": 0,
-                        "subprocs_pending": 0,
-                        "retained_id_checked": scenario == "retained-id",
-                        "retained_id_valid": scenario == "retained-id",
-                    }
-                    if scenario == "retained-id" and mode == "reclaim" and phase == "reclaim":
-                        sample["arenas_kept"] = 1
-                    sample.update(dict.fromkeys(METRICS, 0))
-                    sample["rss_bytes"] = (10 if reclaimed else 20) * 1048576
-                    sample["private_bytes"] = (8 if reclaimed else 18) * 1048576
-                    sample["allocator_reserved_bytes"] = (100 if reclaimed else 200) * 1048576
-                    samples.append(sample)
-                records.append(
-                    {
-                        "owner_gate": False,
-                        "purge_decommits": "1",
-                        "scenario": scenario,
-                        "repeat": repeat,
-                        "mode": mode,
-                        "samples": samples,
-                    }
-                )
+        for thread_state in THREAD_STATES:
+            for repeat in range(3):
+                for mode in ("purge-only", "reclaim"):
+                    samples: list[dict[str, Any]] = []
+                    for i, phase in enumerate(PHASES):
+                        reclaimed = mode == "reclaim" and scenario == "empty" and phase == "reclaim"
+                        sample = {
+                            "phase": phase,
+                            "wave": 0 if i == 0 else 1 if i < 5 else 2,
+                            "elapsed_ms": 1.0,
+                            "reclaim_requested": mode == "reclaim" and phase == "reclaim",
+                            "reclaim_pass_ran": mode == "reclaim" and phase == "reclaim",
+                            "reclaim_result": (
+                                "released"
+                                if reclaimed
+                                else "no-eligible-arena"
+                                if mode == "reclaim" and phase == "reclaim"
+                                else "not-requested"
+                            ),
+                            "purge_status": 0,
+                            "arenas_reclaimed": 1 if reclaimed else 0,
+                            "arena_reclaim_bytes": 100 * 1048576 if reclaimed else 0,
+                            "arenas_kept": 0,
+                            "subprocs_pending": 0,
+                            "retained_id_checked": scenario == "retained-id",
+                            "retained_id_valid": scenario == "retained-id",
+                            "worker_started": thread_state != "none",
+                            "worker_parked": thread_state == "idle",
+                        }
+                        if scenario == "retained-id" and mode == "reclaim" and phase == "reclaim":
+                            sample["arenas_kept"] = 1
+                        sample.update(dict.fromkeys(METRICS, 0))
+                        sample["rss_bytes"] = (10 if reclaimed else 20) * 1048576
+                        sample["private_bytes"] = (8 if reclaimed else 18) * 1048576
+                        sample["allocator_reserved_bytes"] = (100 if reclaimed else 200) * 1048576
+                        samples.append(sample)
+                    records.append(
+                        {
+                            "owner_gate": False,
+                            "purge_decommits": "1",
+                            "scenario": scenario,
+                            "thread_state": thread_state,
+                            "repeat": repeat,
+                            "mode": mode,
+                            "samples": samples,
+                        }
+                    )
+    base_records = records
+    records = []
+    for owner_gate in (False, True):
+        for purge_decommits in ("0", "1"):
+            for base_record in base_records:
+                record = deepcopy(base_record)
+                record["owner_gate"] = owner_gate
+                record["purge_decommits"] = purge_decommits
+                records.append(record)
     return {
         "schema": "arena-reclaim-v1",
         "source_sha": "a" * 40,

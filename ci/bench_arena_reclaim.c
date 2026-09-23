@@ -1,18 +1,15 @@
-/* Standalone measurement child for ci/bench_arena_reclaim.py (#438).
+/* Standalone C++ measurement child for ci/bench_arena_reclaim.py (#438).
    No CMake test registration: this is a benchmark, not a correctness gate. */
 #include <mimalloc.h>
 #include <mimalloc-stats.h>
-#ifdef __cplusplus
 #include <atomic>
+#include <thread>
 #ifndef MI_USE_CXX
 extern "C" {
 #endif
-#endif
 #include "mimalloc/internal.h"
-#ifdef __cplusplus
 #ifndef MI_USE_CXX
 }
-#endif
 #endif
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +28,28 @@ extern "C" {
 
 static int g_retained_id_checked = 0;
 static int g_retained_id_valid = 0;
+static std::atomic<bool> g_worker_ready(false);
+static std::atomic<bool> g_worker_stop(false);
+static std::atomic<bool> g_worker_parked(false);
+
+static void worker_loop(bool idle) {
+  void* live = mi_malloc(64);
+  if (live == NULL) exit(5);
+  if (idle) {
+    const bool parked = mi_on_thread_idle_start();
+    g_worker_parked.store(parked, std::memory_order_release);
+    g_worker_ready.store(true, std::memory_order_release);
+    while (!g_worker_stop.load(std::memory_order_acquire)) std::this_thread::yield();
+    if (parked) mi_on_thread_idle_end();
+  } else {
+    g_worker_ready.store(true, std::memory_order_release);
+    while (!g_worker_stop.load(std::memory_order_acquire)) {
+      void* p = mi_malloc(64);
+      if (p != NULL) mi_free(p);
+    }
+  }
+  mi_free(live);
+}
 
 static double seconds_now(void) {
 #ifdef _WIN32
@@ -85,6 +104,16 @@ static process_memory_t process_memory(void) {
 
 static void sample(const char* phase, int wave, double elapsed_ms,
                    int requested, int status, const mi_purge_all_report_t* report) {
+  const char* reclaim_result = "not-requested";
+  if (requested) {
+    if (status == MI_PURGE_BUSY) reclaim_result = "purge-busy";
+    else if (report == NULL || !report->reclaimed) {
+      reclaim_result = (report != NULL && report->subprocs_pending > 0)
+                         ? "pending-subprocess" : "arena-layer-busy";
+    }
+    else if (report->arenas_reclaimed == 0) reclaim_result = "no-eligible-arena";
+    else reclaim_result = "released";
+  }
   process_memory_t pm = process_memory();
   mi_stats_t_decl(stats);
   if (!mi_stats_get(&stats)) exit(4);
@@ -95,19 +124,24 @@ static void sample(const char* phase, int wave, double elapsed_ms,
          "\"allocator_reserved_bytes\":%llu,\"allocator_committed_bytes\":%lld,"
          "\"arena_metadata_bytes\":%llu,\"elapsed_ms\":%.6f,"
          "\"reclaim_requested\":%s,\"purge_status\":%d,\"reclaim_pass_ran\":%s,"
+         "\"reclaim_result\":\"%s\","
          "\"arenas_reclaimed\":%llu,\"arena_reclaim_bytes\":%llu,"
          "\"arenas_kept\":%llu,\"subprocs_pending\":%llu,"
-         "\"retained_id_checked\":%s,\"retained_id_valid\":%s}\n",
+         "\"retained_id_checked\":%s,\"retained_id_valid\":%s,"
+         "\"worker_started\":%s,\"worker_parked\":%s}\n",
          phase, wave, (unsigned long long)pm.rss,
          (unsigned long long)pm.private_bytes, (unsigned long long)pm.virtual_bytes,
          (unsigned long long)holes.arena_reserved_bytes, (long long)stats.committed.current,
          (unsigned long long)holes.arena_meta_bytes, elapsed_ms,
          requested ? "true" : "false", status, report && report->reclaimed ? "true" : "false",
+         reclaim_result,
          (unsigned long long)(report ? report->arenas_reclaimed : 0),
          (unsigned long long)(report ? report->arena_reclaim_bytes : 0),
          (unsigned long long)(report ? report->arenas_kept : 0),
          (unsigned long long)(report ? report->subprocs_pending : 0),
-         g_retained_id_checked ? "true" : "false", g_retained_id_valid ? "true" : "false");
+         g_retained_id_checked ? "true" : "false", g_retained_id_valid ? "true" : "false",
+         g_worker_ready.load(std::memory_order_acquire) ? "true" : "false",
+         g_worker_parked.load(std::memory_order_acquire) ? "true" : "false");
   fflush(stdout);
 }
 
@@ -119,15 +153,20 @@ static void* alloc_touched(void) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 3 || (strcmp(argv[1], "purge-only") != 0 && strcmp(argv[1], "reclaim") != 0) ||
-      (strcmp(argv[2], "empty") != 0 && strcmp(argv[2], "nonempty") != 0 && strcmp(argv[2], "retained-id") != 0)) {
-    fprintf(stderr, "usage: bench_arena_reclaim {purge-only|reclaim} {empty|nonempty|retained-id}\n");
+  if (argc != 4 || (strcmp(argv[1], "purge-only") != 0 && strcmp(argv[1], "reclaim") != 0) ||
+      (strcmp(argv[2], "empty") != 0 && strcmp(argv[2], "nonempty") != 0 && strcmp(argv[2], "retained-id") != 0) ||
+      (strcmp(argv[3], "none") != 0 && strcmp(argv[3], "idle") != 0 && strcmp(argv[3], "active") != 0)) {
+    fprintf(stderr, "usage: bench_arena_reclaim {purge-only|reclaim} {empty|nonempty|retained-id} {none|idle|active}\n");
     return 2;
   }
   const int reclaim = strcmp(argv[1], "reclaim") == 0;
   const int keep_live = strcmp(argv[2], "nonempty") == 0;
+  const bool worker_present = strcmp(argv[3], "none") != 0;
+  const bool worker_idle = strcmp(argv[3], "idle") == 0;
   mi_option_set(mi_option_arena_reserve, (long)(32 * 1024)); /* KiB; one big object / arena */
-  mi_scavenger_stop();
+  /* A cooperative park requires the scavenger to be running. stop() is a
+     permanent shutdown, so use it only in the no-worker/active controls. */
+  if (!worker_idle) mi_scavenger_stop();
   void* small = mi_malloc(64); /* keep ordinary process activity separate from big arenas */
   if (small == NULL) return 5;
   mi_arena_id_t retained_id = NULL;
@@ -139,6 +178,11 @@ int main(int argc, char** argv) {
     if (retained_area == NULL || retained_size < 64 * 1024 * 1024) return 6;
     g_retained_id_checked = 1;
     g_retained_id_valid = 1;
+  }
+  std::thread worker;
+  if (worker_present) {
+    worker = std::thread(worker_loop, worker_idle);
+    while (!g_worker_ready.load(std::memory_order_acquire)) std::this_thread::yield();
   }
   void* blocks[BIG_COUNT];
   sample("baseline", 0, 0.0, 0, 0, NULL);
@@ -174,6 +218,10 @@ int main(int argc, char** argv) {
       mi_purge_all_ex(MI_PURGE_FORCE, 100, NULL);
     }
     /* The next wave's peak time is the regrowth cost; two waves expose churn. */
+  }
+  if (worker_present) {
+    g_worker_stop.store(true, std::memory_order_release);
+    worker.join();
   }
   mi_free(small);
   return 0;
