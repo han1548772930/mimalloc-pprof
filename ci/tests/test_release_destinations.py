@@ -20,6 +20,12 @@ class FakeDestination:
         self.frozen: dict[str, object] | None = None
         self.events: list[str] = []
         self.upload_failures = 0
+        self.ambiguous_writes: set[str] = set()
+
+    def maybe_ambiguous(self, name: str) -> None:
+        if name in self.ambiguous_writes:
+            self.ambiguous_writes.remove(name)
+            raise rd.TransientGitHubError("response lost after successful write")
 
     def tag_sha(self, tag: str) -> str | None:
         return self.tag
@@ -41,10 +47,12 @@ class FakeDestination:
     def create_tag(self, tag: str, sha: str) -> None:
         self.tag = sha
         self.events.append("tag")
+        self.maybe_ambiguous("tag")
 
     def create_draft(self, tag: str, sha: str) -> None:
         self.draft = True
         self.events.append("draft")
+        self.maybe_ambiguous("draft")
 
     def upload_asset(self, tag: str, name: str, path: Path) -> None:
         if self.upload_failures:
@@ -52,6 +60,7 @@ class FakeDestination:
             raise rd.TransientGitHubError("HTTP 503")
         self.assets[name] = rd.file_sha256(path)
         self.events.append(f"asset:{name}")
+        self.maybe_ambiguous(f"asset:{name}")
 
     def publish_crate(self, path: Path) -> None:
         self.crate = rd.file_sha256(path)
@@ -60,6 +69,7 @@ class FakeDestination:
     def finalize(self, tag: str) -> None:
         self.draft = False
         self.events.append("finalize")
+        self.maybe_ambiguous("finalize")
 
 
 class DestinationTests(unittest.TestCase):
@@ -126,6 +136,28 @@ class DestinationTests(unittest.TestCase):
         self.run_worker()
         self.assertNotIn("crate", self.backend.events)
         self.assertIn("finalize", self.backend.events)
+
+    def test_lost_success_responses_are_verified_without_duplicate_writes(self) -> None:
+        self.backend.ambiguous_writes = {
+            "tag",
+            "draft",
+            f"asset:{self.value['assets'][0]}",
+            "finalize",
+        }
+        self.run_worker()
+        self.assertEqual(self.backend.events.count("tag"), 1)
+        self.assertEqual(self.backend.events.count("draft"), 1)
+        self.assertEqual(self.backend.events.count("finalize"), 1)
+        self.assertEqual(self.backend.events.count(f"asset:{self.value['assets'][0]}"), 1)
+
+    def test_annotated_tag_resolves_to_commit(self) -> None:
+        ref = '{"object":{"type":"tag","sha":"' + "b" * 40 + '"}}'
+        tag_obj = '{"object":{"type":"commit","sha":"' + "a" * 40 + '"}}'
+        with (
+            patch.object(rd.ReadOnlyDestination, "_gh_optional", return_value=ref),
+            patch.object(rd.ReadOnlyDestination, "_gh_required", return_value=tag_obj),
+        ):
+            self.assertEqual(rd.ReadOnlyDestination().tag_sha("v1.0.1"), "a" * 40)
 
 
 if __name__ == "__main__":

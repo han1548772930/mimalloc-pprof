@@ -65,7 +65,16 @@ class ReadOnlyDestination:
         if raw is None:
             return None
         data = json.loads(raw)
-        return str(data["object"]["sha"])
+        obj = data["object"]
+        for _ in range(10):
+            if obj["type"] == "commit":
+                return str(obj["sha"])
+            if obj["type"] != "tag":
+                raise release.ReleaseError("release tag does not resolve to a commit")
+            obj = json.loads(self._gh_required(f"repos/{release.REPO}/git/tags/{obj['sha']}"))[
+                "object"
+            ]
+        raise release.ReleaseError("release tag indirection exceeds ten levels")
 
     def release(self, tag: str) -> ReleaseState | None:
         raw = self._gh_optional(f"repos/{release.REPO}/releases/tags/{tag}")
@@ -88,6 +97,13 @@ class ReadOnlyDestination:
         if "HTTP 404" in result.stderr:
             return None
         raise release.ReleaseError(f"GitHub read failed: {result.stderr.strip()}")
+
+    @classmethod
+    def _gh_required(cls, endpoint: str) -> str:
+        raw = cls._gh_optional(endpoint)
+        if raw is None:
+            raise release.ReleaseError("release tag object disappeared during verification")
+        return raw
 
     def crate_checksum(self, version: str) -> str | None:
         url = f"https://crates.io/api/v1/crates/mimalloc-pprof/{version}"
@@ -195,6 +211,7 @@ def github_retry(
     operation: Callable[[], None],
     *,
     log: Callable[[str], None],
+    completed: Callable[[], bool] | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Retry only explicitly transient GitHub failures, at most ten attempts."""
@@ -204,6 +221,10 @@ def github_retry(
             return
         except TransientGitHubError as error:
             log(f"github transient attempt={attempt}/10: {error}")
+            # The server may have committed the write before the response failed.
+            if completed is not None and completed():
+                log("github: verified write after ambiguous response")
+                return
             if attempt == 10:
                 raise
             sleep(min(2 ** (attempt - 1), 30))
@@ -223,19 +244,57 @@ def execute(
     """Run a frozen plan with an injected destination; no live adapter exists."""
     plan = preflight(destination, directive, info, dist, crate, frozen)
     tag, sha = str(directive["tag"]), str(directive["candidate_sha"])
+    expected_assets = cast(dict[str, str], plan.freeze["asset_sha256"])
+
+    def tag_done() -> bool:
+        observed = destination.tag_sha(tag)
+        if observed is not None and observed != sha:
+            raise release.ReleaseError("immutable tag points to another candidate")
+        return observed == sha
+
+    def release_done(*, draft: bool) -> bool:
+        observed = destination.release(tag)
+        if observed is None:
+            return False
+        if observed.target_sha != sha:
+            raise release.ReleaseError("GitHub Release targets another candidate")
+        return observed.draft == draft
+
+    def asset_done(name: str) -> bool:
+        observed = destination.release(tag)
+        if observed is None:
+            return False
+        if observed.target_sha != sha:
+            raise release.ReleaseError("GitHub Release targets another candidate")
+        digest = observed.assets.get(name)
+        if digest is not None and digest != expected_assets[name]:
+            raise release.ReleaseError(f"GitHub asset conflict: {name}")
+        return digest == expected_assets[name]
+
     if frozen is None:
         destination.freeze(plan.freeze)
         log("issue: frozen directive, info.json, asset hashes, and crate hash")
     if plan.missing_tag:
-        github_retry(lambda: destination.create_tag(tag, sha), log=log, sleep=sleep)
+        github_retry(
+            lambda: destination.create_tag(tag, sha),
+            log=log,
+            completed=tag_done,
+            sleep=sleep,
+        )
         log("github: tag created")
     if plan.missing_release:
-        github_retry(lambda: destination.create_draft(tag, sha), log=log, sleep=sleep)
+        github_retry(
+            lambda: destination.create_draft(tag, sha),
+            log=log,
+            completed=lambda: release_done(draft=True),
+            sleep=sleep,
+        )
         log("github: draft created")
     for name in plan.missing_assets:
         github_retry(
             lambda name=name: destination.upload_asset(tag, name, dist / name),
             log=log,
+            completed=lambda name=name: asset_done(name),
             sleep=sleep,
         )
         log(f"github: asset verified {name}")
@@ -252,7 +311,12 @@ def execute(
     ):
         raise release.ReleaseError("destination verification incomplete; resume with same freeze")
     if complete.finalize:
-        github_retry(lambda: destination.finalize(tag), log=log, sleep=sleep)
+        github_retry(
+            lambda: destination.finalize(tag),
+            log=log,
+            completed=lambda: release_done(draft=False),
+            sleep=sleep,
+        )
     final = preflight(destination, directive, info, dist, crate, plan.freeze)
     if (
         final.missing_tag
