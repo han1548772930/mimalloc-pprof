@@ -464,8 +464,10 @@ through soldr's Darwin toolchains, and the x86_64 bundle is *executed* on an
 `ubuntu-24.04` runner inside a [`dockurr/macos`](https://github.com/dockur/macos) guest
 (QEMU + KVM) for manual Recovery diagnostics. A literal `ci-full` PR label or an explicit
 `ci-mode=full` dispatch additionally executes the same Linux-built C and Rust test
-artifacts on hosted `macos-15` (ARM64) and `macos-15-intel` (x64). The native job checks
-the release and debug-full C bundles' JUnit files against their manifests, so missing or skipped tests fail. The only
+artifacts on hosted `macos-15` (ARM64) and `macos-15-intel` (x64). For each architecture
+and each release/debug-full C bundle, the native job runs ordinary tests without privilege
+and runs `test-osx-zone-introspect-remote` alone through `sudo` for `task_for_pid`. It
+unions the two JUnit reports against the bundle manifest, so missing or skipped tests fail. The only
 macOS runner labels permitted by `ci/lint_no_macos_runners.py` are in that opt-in job.
 The full dispatch requires a lowercase 40-hex `candidate_sha`; `resolve-candidate`
 checks out that commit and verifies `git rev-parse HEAD` before any build or execution.

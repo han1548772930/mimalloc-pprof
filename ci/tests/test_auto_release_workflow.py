@@ -166,9 +166,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
 
     def test_dry_run_has_no_external_write_steps(self) -> None:
         workflow = self.doc
-        triggers = workflow.get(
-            "on", workflow.get(True)
-        )  # PyYAML 1.1 treats `on` as boolean.
+        triggers = workflow.get("on", workflow.get(True))  # PyYAML 1.1 treats `on` as boolean.
         self.assertTrue(triggers["workflow_dispatch"]["inputs"]["dry_run"]["default"])
         release = self.jobs()["release"]
         steps = release["steps"]
@@ -190,9 +188,9 @@ class AutoReleaseStructureTests(unittest.TestCase):
         )
         tag_script = tag_step["run"]
         self.assertIn('if [ "$IS_DRY_RUN" = "true" ]; then', tag_script)
-        dry_branch = tag_script.split('if [ "$IS_DRY_RUN" = "true" ]; then', 1)[
-            1
-        ].split("else", 1)[0]
+        dry_branch = tag_script.split('if [ "$IS_DRY_RUN" = "true" ]; then', 1)[1].split("else", 1)[
+            0
+        ]
         self.assertIn("suffix=$(git rev-parse HEAD)", dry_branch)
         self.assertNotIn("tag=", dry_branch)
         self.assertIn("steps.tag.outputs.suffix", job_run_text(release))
@@ -246,9 +244,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 for step in job["steps"]
                 if str(step.get("uses", "")).startswith("actions/checkout")
             )
-            self.assertEqual(
-                checkout["with"]["ref"], "${{ inputs.candidate_sha || github.sha }}"
-            )
+            self.assertEqual(checkout["with"]["ref"], "${{ inputs.candidate_sha || github.sha }}")
         release_checkout = next(
             step
             for step in release["steps"]
@@ -273,8 +269,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
         block = next(
             step
             for step in release["steps"]
-            if step.get("name")
-            == "Require fleet all-platform full gate before publication"
+            if step.get("name") == "Require fleet all-platform full gate before publication"
         )
         self.assertEqual(block["if"], "env.IS_DRY_RUN != 'true'")
         self.assertIn("exit 1", block["run"])
@@ -294,9 +289,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
             if step.get("name")
             == "Require exact-SHA full native macOS evidence before any release write"
         )
-        head = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-        ).strip()
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         jobs = [
             {"name": name, "status": "completed", "conclusion": "success"}
             for name in (
@@ -314,7 +307,10 @@ class AutoReleaseStructureTests(unittest.TestCase):
           esac
         }
         git() {
-          if [ "$MOCK_UNMERGED" = 1 ] && [ "$1" = merge-base ]; then return 1; fi
+          if [ "$1" = merge-base ]; then
+            [ "$MOCK_UNMERGED" != 1 ]
+            return $?
+          fi
           command git "$@"
         }
         """

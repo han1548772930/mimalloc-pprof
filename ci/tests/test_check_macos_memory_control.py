@@ -19,10 +19,15 @@ class NativeMacControlTests(unittest.TestCase):
         for index in range(8):
             path = self.root / f"{prefix}-{index}.json"
             path.write_text(
-                json.dumps({
-                    "platform": "macos", "gated_metric": "peak_rss", "mi_pprof": 1,
-                    "inject_leak": leak, "peak_mb": peak,
-                }),
+                json.dumps(
+                    {
+                        "platform": "macos",
+                        "gated_metric": "peak_rss",
+                        "mi_pprof": 1,
+                        "inject_leak": leak,
+                        "peak_mb": peak,
+                    }
+                ),
                 encoding="utf-8",
             )
             paths.append(path)

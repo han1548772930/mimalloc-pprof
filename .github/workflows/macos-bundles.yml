@@ -657,12 +657,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p results
+          python="$(python3 -c 'import sys; print(sys.executable)')"
+          test "${python:0:1}" = / || { echo '::error::Python interpreter is not absolute'; exit 1; }
+          status=0
           for config in release debug-full; do
             name="macos-${{ matrix.arch }}-$config"
-            python3 ci/run_test_bundle.py "bundles/$name" --junit "results/$name.xml"
+            mkdir -p "results/$name"
+            "$python" ci/run_test_bundle.py "bundles/$name" \
+              --exclude test-osx-zone-introspect-remote \
+              --junit "results/$name/ordinary.xml" || status=1
+            sudo -n "$python" ci/run_test_bundle.py "bundles/$name" \
+              --only test-osx-zone-introspect-remote \
+              --junit "results/$name/remote-root.xml" || status=1
             python3 ci/bundle_coverage.py --compare "$name" \
-              "bundles/$name/tests.json" "results/$name.xml"
+              "bundles/$name/tests.json" "results/$name" || status=1
           done
+          exit "$status"
       - name: Prove the shipped leak control fires on native macOS
         run: |
           set -euo pipefail

@@ -42,6 +42,27 @@ class LintNoMacosRunnersTests(unittest.TestCase):
         self.assertIn("ci/check_macos_memory_control.py", steps)
         self.assertIn("macos-${{ matrix.arch }}-leak/mimalloc-test-memory-gate", steps)
 
+    def test_full_lane_runs_remote_zone_as_root_for_each_bundle_and_arch(self) -> None:
+        workflow = yaml.safe_load((WORKFLOWS / "macos-bundles.yml").read_text(encoding="utf-8"))
+        job = workflow["jobs"]["run-macos-native-full"]
+        self.assertEqual(
+            {row["arch"] for row in job["strategy"]["matrix"]["include"]}, {"arm64", "x64"}
+        )
+        step = next(
+            s
+            for s in job["steps"]
+            if s.get("name") == "Execute the shipped C bundles on native macOS"
+        )
+        script = step["run"]
+        self.assertIn("for config in release debug-full; do", script)
+        self.assertIn("--exclude test-osx-zone-introspect-remote", script)
+        self.assertIn("--only test-osx-zone-introspect-remote", script)
+        self.assertIn('sudo -n "$python" ci/run_test_bundle.py', script)
+        self.assertIn("import sys; print(sys.executable)", script)
+        self.assertIn('"bundles/$name/tests.json" "results/$name"', script)
+        self.assertIn("ordinary.xml", script)
+        self.assertIn("remote-root.xml", script)
+
     def test_every_job_checks_out_the_resolved_candidate(self) -> None:
         workflow = yaml.safe_load((WORKFLOWS / "macos-bundles.yml").read_text(encoding="utf-8"))
         jobs = workflow["jobs"]
@@ -58,7 +79,9 @@ class LintNoMacosRunnersTests(unittest.TestCase):
             self.assertIn("resolve-candidate", job["needs"], name)
             checkouts = [s for s in job["steps"] if s.get("uses") == "actions/checkout@v4"]
             self.assertEqual(len(checkouts), 1, name)
-            self.assertEqual(checkouts[0]["with"]["ref"], "${{ needs.resolve-candidate.outputs.sha }}")
+            self.assertEqual(
+                checkouts[0]["with"]["ref"], "${{ needs.resolve-candidate.outputs.sha }}"
+            )
 
     def test_full_lane_exception_fails_when_gate_is_removed(self) -> None:
         from copy import deepcopy
@@ -69,8 +92,10 @@ class LintNoMacosRunnersTests(unittest.TestCase):
         offenders = list(lint.offenders(weakened))
         self.assertEqual(len(offenders), 2)
         self.assertTrue(
-            all(not lint.allowed_full_runner(WORKFLOWS / "macos-bundles.yml", weakened, path, label)
-                for path, label in offenders)
+            all(
+                not lint.allowed_full_runner(WORKFLOWS / "macos-bundles.yml", weakened, path, label)
+                for path, label in offenders
+            )
         )
 
     def test_the_inherited_azure_pipeline_is_scanned_and_clean(self) -> None:

@@ -37,7 +37,10 @@ def check(normal: list[Path], leaked: list[Path]) -> None:
 
 if __name__ == "__main__":
     try:
-        check(sorted(Path("results").glob("normal-*.json")), sorted(Path("results").glob("leak-*.json")))
+        check(
+            sorted(Path("results").glob("normal-*.json")),
+            sorted(Path("results").glob("leak-*.json")),
+        )
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"macOS memory positive control failed: {error}", file=sys.stderr)
         raise SystemExit(1) from error
