@@ -63,8 +63,10 @@ class AutoReleaseStructureTests(unittest.TestCase):
     def jobs(self) -> dict[str, Any]:
         return cast(dict[str, Any], self.doc["jobs"])
 
-    def test_every_job_runs_on_linux(self) -> None:
+    def test_build_and_publication_jobs_run_on_linux(self) -> None:
         for name, job in self.jobs().items():
+            if name == "smoke-shipped-assets":
+                continue
             runs_on = job.get("runs-on")
             self.assertEqual(
                 runs_on,
@@ -111,7 +113,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
     def test_every_uploaded_artifact_is_downloaded_by_release(self) -> None:
         uploaded: set[str] = set()
         for name, job in self.jobs().items():
-            if name == "release":
+            if name in ("release", "smoke-shipped-assets"):
                 continue
             for step in job.get("steps", []):
                 if str(step.get("uses", "")).startswith("actions/upload-artifact"):
@@ -126,6 +128,8 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 if "pattern" in with_:
                     patterns.append(str(with_["pattern"]))
         for artifact in uploaded:
+            if artifact.startswith("release-preflight-"):
+                continue
             covered = artifact in downloaded or any(
                 artifact.startswith(pattern.rstrip("*")) for pattern in patterns
             )
@@ -134,6 +138,27 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 f"artifact {artifact!r} is uploaded but never downloaded by `release`; it "
                 "would not reach the GitHub Release",
             )
+
+    def test_dry_run_smokes_every_shipped_archive_on_matching_host(self) -> None:
+        smoke = self.jobs()["smoke-shipped-assets"]
+        self.assertEqual(smoke["if"], "inputs.dry_run == true")
+        self.assertEqual(smoke["needs"], ["release"])
+        self.assertEqual(
+            {row["asset"]: row["runner"] for row in smoke["strategy"]["matrix"]["include"]},
+            {
+                "macos-arm64": "macos-15",
+                "macos-x86_64": "macos-15-intel",
+                "windows-x64-gnu": "windows-latest",
+                "windows-x64-msvc": "windows-latest",
+            },
+        )
+        steps = smoke["steps"]
+        self.assertEqual(steps[0]["with"]["ref"], "${{ inputs.candidate_sha }}")
+        self.assertEqual(steps[1]["with"]["python-version"], "3.12")
+        self.assertEqual(steps[2]["with"]["name"], "release-preflight-${{ inputs.candidate_sha }}")
+        self.assertIn('"$(git rev-parse HEAD)" = "$CANDIDATE_SHA"', steps[3]["run"])
+        self.assertIn("ci/smoke_release_archive.py", steps[3]["run"])
+        self.assertIn('--asset "$ASSET"', steps[3]["run"])
 
     def test_release_files_rename_and_matrix_agree(self) -> None:
         release = self.jobs()["release"]

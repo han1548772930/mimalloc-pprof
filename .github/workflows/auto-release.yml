@@ -680,6 +680,50 @@ jobs:
             dist/mimalloc-pprof-windows-x64-gnu-${{ steps.tag.outputs.tag }}.zip
             dist/mimalloc-pprof-windows-x64-msvc-${{ steps.tag.outputs.tag }}.zip
 
+  # Dry-run pretag evidence from the actual packaged libraries. Publication remains
+  # fail-closed above; before enabling it, move this gate ahead of all release writes.
+  smoke-shipped-assets:
+    name: Smoke shipped archive (${{ matrix.asset }})
+    if: inputs.dry_run == true
+    needs: [release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: macos-arm64
+            runner: macos-15
+          - asset: macos-x86_64
+            runner: macos-15-intel
+          - asset: windows-x64-gnu
+            runner: windows-latest
+          - asset: windows-x64-msvc
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download exact worker preflight archive and info.json
+        uses: actions/download-artifact@v4
+        with:
+          name: release-preflight-${{ inputs.candidate_sha }}
+          path: dist
+      - name: Verify checkout and smoke packaged library
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          python3 ci/smoke_release_archive.py --dist dist --asset "$ASSET" --candidate-sha "$CANDIDATE_SHA"
+
   # Issue #55: the publish job is gated on every build job, so a single transient runner
   # failure silently turns a tagged release into a no-op. This job makes that outcome
   # impossible to miss and says exactly how to recover. (The "three OS builds" this comment

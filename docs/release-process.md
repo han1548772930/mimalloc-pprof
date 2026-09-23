@@ -61,6 +61,25 @@ full test jobs executed the same library bytes: `auto-release.yml` builds its
 installable assets in separate jobs from `macos-bundles.yml` and
 `windows-bundles.yml`, whose test bundles are built again.
 
+The dry-run worker now also downloads its preflight artifact in four native
+`smoke-shipped-assets` jobs (hosted Intel Mac, Apple Silicon Mac, and two Windows
+DLL lanes). Each job checks the exact candidate checkout, compares the outer
+archive and the packaged library's SHA-256 with `info.json`, then calls
+`mi_malloc` and `mi_free` through that packaged library. This is an allocation
+smoke, not the full suite, and the real publication path remains fail-closed.
+The smoke currently follows the dry-run preflight upload; before enabling real
+publication, it must become a required predecessor of every write.
+
+Hash-matching the full macOS/Windows test bundle library to these archives is
+not possible with the current build settings. The release build enables
+`MI_PPROF`, `MI_MEMEVT`, and `MI_DIAGNOSTICS` with `MI_BUILD_TESTS=OFF`; full
+test bundle configurations also enable `MI_DHAT` or select other feature sets,
+and are separately configured and linked. The resulting library bytes are not
+expected to match even at the same source SHA and toolchain. Publication must
+stay disabled until a matching installable library is included in the native
+test execution artifact or the release archives are derived from exactly those
+executed bytes, with hashes verified against the recorded full-run artifacts.
+
 Before publication, make each release archive derive from the exact Linux-built
 Release bundle artifact that the native target runner downloaded and executed,
 or include the installable library in that test bundle and make the release
