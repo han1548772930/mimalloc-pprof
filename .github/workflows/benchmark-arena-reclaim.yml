@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # A pull_request checkout uses a synthetic merge commit; pin the real head
+  # instead so the benchmark source remains fetchable after the PR is merged.
+  BENCH_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
   linux:
     runs-on: ubuntu-24.04

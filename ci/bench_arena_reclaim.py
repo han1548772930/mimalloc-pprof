@@ -169,7 +169,11 @@ def measure(
 ) -> dict[str, Any]:
     if runs < 3:
         raise ValueError("at least three paired repetitions are required")
-    sha = os.environ.get("GITHUB_SHA") or run(["git", "rev-parse", "HEAD"]).strip()
+    sha = (
+        os.environ.get("BENCH_SOURCE_SHA")
+        or os.environ.get("GITHUB_SHA")
+        or run(["git", "rev-parse", "HEAD"]).strip()
+    )
     if allocator_source.resolve() != ROOT.resolve() and not allocator_source_sha:
         raise ValueError("a separate allocator checkout requires --allocator-source-sha")
     is_baseline = allocator_source.resolve() != ROOT.resolve()
