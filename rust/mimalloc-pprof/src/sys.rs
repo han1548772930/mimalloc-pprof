@@ -166,6 +166,13 @@ pub type mi_purge_flags_t = c_int;
 /// `MI_PURGE_FORCE` (`mi_purge_flags_t`, issue #366): ignore `purge_delay` / hole-purge
 /// pacing, and let a claimed sweep run to completion (ignoring `park_reclaim`).
 pub const MI_PURGE_FORCE: mi_purge_flags_t = 1;
+/// `MI_PURGE_RECLAIM` (`mi_purge_flags_t`): after the walk, give back every
+/// arena of every sub-process that is COMPLETELY free -- its metadata included (phase F
+/// of `mi_purge_all_ex`; C: docs/arena-reclaim.md). That needs every thread of the
+/// sub-process to be OUT of the allocator at one and the same instant, so it is best
+/// effort by construction: a sub-process where that fails is reported in
+/// `mi_purge_all_report_t::subprocs_pending` and nothing is released there.
+pub const MI_PURGE_RECLAIM: mi_purge_flags_t = 2;
 
 /// `MI_PURGE_OK` (issue #366): every registered thread was reached.
 pub const MI_PURGE_OK: c_int = 0;
@@ -197,6 +204,20 @@ pub struct mi_purge_all_report_t {
     pub gated: bool,
     /// `theaps_pending == 0 && theaps_orphaned == 0`.
     pub complete: bool,
+    /// phase F: arenas released to the OS (their metadata included).
+    pub arenas_reclaimed: usize,
+    /// phase F: the reservation bytes those arenas held.
+    pub arena_reclaim_bytes: usize,
+    /// phase F: arenas seen completely free and NOT released -- not this library's
+    /// to give back (exclusive, pinned, or externally managed memory).
+    pub arenas_kept: usize,
+    /// phase F: sub-processes whose threads could not all be claimed at once;
+    /// nothing was released there. Retry later, ideally from a quiescent point.
+    pub subprocs_pending: usize,
+    /// phase F: the flag was passed and nothing blocked a pass (no pending
+    /// sub-process, and the arena layer was free). Says the pass RAN, not that it found
+    /// anything: `arenas_reclaimed` is the count.
+    pub reclaimed: bool,
 }
 
 // ---------------------------------------------------------------------------------------

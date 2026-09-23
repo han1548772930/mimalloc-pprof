@@ -150,7 +150,7 @@ The short version. Safe wrappers, all at the crate root unless noted:
 | `stats` | the allocator's **exact** counters: `get()`, `json()`, `print()`, `bin_size()`, and the subprocess-scoped forms |
 | `memory_events` | allocation-change accounting: `set_enabled`, `snapshot`, `set_callbacks`, `visit_live_allocations` (needs the `memory-events` feature) |
 | `options` | every `mi_option_t`, including the fourteen this fork adds (`Opt::PROF`, `Opt::SCAVENGER`, `Opt::PURGE_HOLES`, …) |
-| crate root | `MiMalloc`, `heap_dump_json` / `heap_snapshot_to_file` (need the `diagnostics` feature), `on_thread_idle`, `park_while_idle`, `scavenger_stop`, `purge_all`/`purge_all_ex`, `purge_holes_stats`, `purge_holes_report`, `rezalloc`/`recalloc`/`expand`, `unwrapped_malloc`/`_free`/`_realloc` |
+| crate root | `MiMalloc`, `heap_dump_json` / `heap_snapshot_to_file` (need the `diagnostics` feature), `on_thread_idle`, `park_while_idle`, `scavenger_stop`, `purge_all`/`purge_all_ex` (with `PurgeFlags::FORCE`/`RECLAIM`), `purge_holes_stats`, `purge_holes_report`, `rezalloc`/`recalloc`/`expand`, `unwrapped_malloc`/`_free`/`_realloc` |
 
 `mimalloc_pprof::sys` holds the raw `unsafe extern "C"` declarations and the `#[repr(C)]`
 struct mirrors behind all of the above. The mirrors are checked field-by-field against

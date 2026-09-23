@@ -405,20 +405,71 @@ pub struct PurgeFlags {
     /// Ignore `purge_delay` and hole-purge pacing, and let a claimed sweep run to
     /// completion (`MI_PURGE_FORCE`). [`purge_all`]`(true)` is this flag set.
     pub force: bool,
+    /// Give back every arena of every sub-process that is COMPLETELY free, its metadata
+    /// included (`MI_PURGE_RECLAIM`). See [`PurgeFlags::RECLAIM`].
+    pub reclaim: bool,
 }
 
 impl PurgeFlags {
-    /// Every flag clear: honour the purge pacing options.
-    pub const NONE: PurgeFlags = PurgeFlags { force: false };
+    /// Every flag clear: honour the purge pacing options and keep every arena.
+    pub const NONE: PurgeFlags = PurgeFlags {
+        force: false,
+        reclaim: false,
+    };
     /// `MI_PURGE_FORCE`.
-    pub const FORCE: PurgeFlags = PurgeFlags { force: true };
+    pub const FORCE: PurgeFlags = PurgeFlags {
+        force: true,
+        reclaim: false,
+    };
+    /// `MI_PURGE_RECLAIM`: also give back the arenas that are completely
+    /// free, their metadata included, instead of leaving them for the process lifetime.
+    ///
+    /// An arena is reserved on demand and, without this flag, nothing in the allocator
+    /// ever gives one back before the process exits -- a block that leaves an arena only
+    /// returns its slices, and the purge that follows merely *decommits* them. What stays
+    /// behind is the arena's whole bookkeeping: the `mi_page_t` table (2.8 MiB per GiB of
+    /// arena) and its bitmaps, committed at initialization. That is a function of the
+    /// process's PEAK, not of its live set, which is what a long-running service sees as
+    /// arena metadata that never shrinks (the case this was added for).
+    ///
+    /// Releasing an arena is not a purge-sized operation: its bitmaps and its slot in the
+    /// sub-process's arena table are lock-free state that any allocation can reach, so
+    /// the pass requires proof that no other thread of the sub-process is inside the
+    /// allocator for its whole duration -- every registered thread claimed at once
+    /// through the same park protocol `purge_all_ex` already uses (with the `owner-gate`
+    /// feature that is every thread outside an allocator call; otherwise the threads
+    /// parked in [`park_while_idle`]). A sub-process where that cannot be established is
+    /// reported in [`PurgeAllReport::subprocs_pending`] with nothing released, and the
+    /// call is then simply a purge: it never waits on a lock it holds and never blocks.
+    ///
+    /// ```no_run
+    /// # use mimalloc_pprof as mi;
+    /// // From a quiescent point: hand back the arenas the peak left behind.
+    /// let (status, report) = mi::purge_all_ex(mi::PurgeFlags::FORCE_RECLAIM, 100);
+    /// assert_ne!(status, mi::PurgeStatus::Busy);
+    /// if report.reclaimed {
+    ///     assert_eq!(report.subprocs_pending, 0);
+    /// }
+    /// ```
+    pub const RECLAIM: PurgeFlags = PurgeFlags {
+        force: false,
+        reclaim: true,
+    };
+    /// `MI_PURGE_FORCE | MI_PURGE_RECLAIM`.
+    pub const FORCE_RECLAIM: PurgeFlags = PurgeFlags {
+        force: true,
+        reclaim: true,
+    };
 
     fn to_c(self) -> sys::mi_purge_flags_t {
+        let mut flags: sys::mi_purge_flags_t = 0;
         if self.force {
-            sys::MI_PURGE_FORCE
-        } else {
-            0
+            flags |= sys::MI_PURGE_FORCE;
         }
+        if self.reclaim {
+            flags |= sys::MI_PURGE_RECLAIM;
+        }
+        flags
     }
 }
 
@@ -470,6 +521,24 @@ pub struct PurgeAllReport {
     pub gated: bool,
     /// `theaps_pending == 0 && theaps_orphaned == 0`.
     pub complete: bool,
+    /// Arenas this call released to the OS, their metadata included.
+    /// Non-zero only with [`PurgeFlags::RECLAIM`].
+    pub arenas_reclaimed: usize,
+    /// The reservation bytes those arenas held.
+    pub arena_reclaim_bytes: usize,
+    /// Arenas this call saw completely free and did NOT release: memory that
+    /// is not the library's to give back -- an exclusive reservation whose `mi_arena_id_t`
+    /// the application still holds, pinned memory, or memory the application manages.
+    pub arenas_kept: usize,
+    /// Sub-processes whose threads could not all be claimed at one instant, so nothing was
+    /// released in them. Retry at a more quiescent point; this is the same
+    /// "pending" shape as [`PurgeAllReport::theaps_pending`], one level up.
+    pub subprocs_pending: usize,
+    /// Whether the reclaim pass RAN with nothing blocking it: the flag was
+    /// passed, no sub-process was pending, and no other arena pass held the layer. Says
+    /// nothing about whether an arena was actually released -- that is
+    /// [`PurgeAllReport::arenas_reclaimed`].
+    pub reclaimed: bool,
 }
 
 impl From<sys::mi_purge_all_report_t> for PurgeAllReport {
@@ -482,6 +551,11 @@ impl From<sys::mi_purge_all_report_t> for PurgeAllReport {
             theaps_orphaned: r.theaps_orphaned,
             gated: r.gated,
             complete: r.complete,
+            arenas_reclaimed: r.arenas_reclaimed,
+            arena_reclaim_bytes: r.arena_reclaim_bytes,
+            arenas_kept: r.arenas_kept,
+            subprocs_pending: r.subprocs_pending,
+            reclaimed: r.reclaimed,
         }
     }
 }
@@ -499,6 +573,12 @@ impl From<sys::mi_purge_all_report_t> for PurgeAllReport {
 /// to claim other threads' state. It does not bound a claimed thread's sweep, nor the
 /// `madvise`/`DiscardVirtualMemory` syscalls that sweep makes, so the call can take longer
 /// than `wait_ms` once it has something to purge.
+///
+/// With [`PurgeFlags::RECLAIM`] the same call also gives back the completely free arenas of
+/// every sub-process, their metadata included (phase F of the C implementation).
+/// `wait_ms` bounds that phase's own retry for a thread that is merely between two
+/// allocator calls; a sub-process whose threads are all inside the allocator at the same
+/// instant is reported in [`PurgeAllReport::subprocs_pending`] rather than waited for.
 ///
 /// [`PurgeStatus::Partial`] is a normal outcome, not a failure: everything reachable was
 /// purged and `theaps_pending` counts the threads that were not. In a default build with
@@ -520,6 +600,9 @@ pub fn purge_all_ex(flags: PurgeFlags, wait_ms: usize) -> (PurgeStatus, PurgeAll
 
 /// Process-wide eager purge from any thread (issue #366), with the C default of a 100 ms
 /// owner-acquisition wait: `mi_purge_all(force)`, but with the report kept.
+///
+/// This is the C convenience form and it never reclaims arenas: use [`purge_all_ex`] with
+/// [`PurgeFlags::RECLAIM`] to give the completely free ones back.
 ///
 /// `force` ignores the `purge_delay` / hole-purge pacing options and lets each claimed
 /// sweep run to completion. See [`purge_all_ex`] for what the wait bounds (owner
