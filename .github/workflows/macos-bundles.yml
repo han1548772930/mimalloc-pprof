@@ -63,7 +63,7 @@ on:
     # No `paths` filter (#360): every job here is a required status check on `main`, and a
     # filtered workflow never reports on a PR outside its paths, leaving that PR BLOCKED.
     # `labeled` so adding `needs-macos` to an open PR re-runs `decide` (#339).
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 concurrency:
   # The macOS pool is the scarce one this whole workflow exists to stop wasting (#277).
@@ -108,8 +108,12 @@ jobs:
           echo "exact candidate_sha=$actual" >> "$GITHUB_STEP_SUMMARY"
 
   build-macos:
-    needs: resolve-candidate
-    # Ungated. The golden-image / unattended-install question (#277, #283) that this
+    needs: [resolve-candidate, decide]
+    # Keep this matrix job present on every PR: branch protection requires each of its
+    # six named rows. Expensive steps run only for full or selective Mac validation.
+    env:
+      RUN_MACOS_BUILD: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.decide.outputs.run == 'true')) }}
+    # The golden-image / unattended-install question (#277, #283) that this
     # lane was parked behind is settled by not needing an installed macOS at all: the
     # x86_64 bundles execute in macOS Recovery, booted off the image on an ordinary
     # Linux runner, so there is nothing to install, cache, or keep alive. The
@@ -178,10 +182,15 @@ jobs:
             triple: x86_64-apple-darwin
             cmake: -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BENCH_INJECT_LEAK=200000
     steps:
+      - name: Report minimal-mode skip
+        if: env.RUN_MACOS_BUILD != 'true'
+        run: echo '${{ matrix.bundle }} is reserved for selective macOS or ci-full validation.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v4
+        if: env.RUN_MACOS_BUILD == 'true'
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
+        if: env.RUN_MACOS_BUILD == 'true'
         with:
           # zccache wraps `soldr cargo`; this job drives CMake directly, so there is
           # nothing for it to wrap. Only the toolchain provisioning is wanted here.
@@ -190,11 +199,13 @@ jobs:
           lockfile: rust/Cargo.lock
           target-dir: rust/target
       - name: Cache the prepared Darwin toolchain
+        if: env.RUN_MACOS_BUILD == 'true'
         uses: actions/cache@v4
         with:
           path: ~/soldr-${{ matrix.triple }}.tar.zst
           key: soldr-prepare-${{ matrix.triple }}-${{ hashFiles('rust/rust-toolchain.toml') }}
       - name: Prepare the soldr Darwin toolchain
+        if: env.RUN_MACOS_BUILD == 'true'
         # `soldr prepare` resolves rustc from a rust-toolchain.toml at or above the
         # working directory, which is why this runs in rust/ like cross.yml does.
         working-directory: rust
@@ -241,7 +252,7 @@ jobs:
         # elsewhere in the file cannot false-positive it. Runs once (this matrix entry
         # only), not once per bundle -- the header does not vary by architecture or build
         # config.
-        if: matrix.bundle == 'macos-arm64-release'
+        if: env.RUN_MACOS_BUILD == 'true' && matrix.bundle == 'macos-arm64-release'
         run: |
           set -euo pipefail
           url="https://raw.githubusercontent.com/apple-oss-distributions/libpthread/main/private/pthread/tsd_private.h"
@@ -270,6 +281,7 @@ jobs:
           fi
           echo "OK: slots 96 and 97 remain unassigned in apple-oss-distributions/libpthread's tsd_private.h"
       - name: Configure for ${{ matrix.triple }}
+        if: env.RUN_MACOS_BUILD == 'true'
         run: |
           set -euo pipefail
           cmake -S . -B build -G Ninja ${{ matrix.cmake }} \
@@ -285,7 +297,9 @@ jobs:
             exit 1
           fi
       - run: cmake --build build --parallel
+        if: env.RUN_MACOS_BUILD == 'true'
       - name: Prove the output is ${{ matrix.arch }} Mach-O with the profiler's Darwin sections
+        if: env.RUN_MACOS_BUILD == 'true'
         env:
           ARCH: ${{ matrix.arch }}
         run: |
@@ -317,12 +331,15 @@ jobs:
               | tee -a "$GITHUB_STEP_SUMMARY"
           fi
       - name: Bundle the tests
+        if: env.RUN_MACOS_BUILD == 'true'
         run: python3 ci/bundle_tests.py build bundle
       - name: Every Darwin-only test carries the `macos` label (#339)
+        if: env.RUN_MACOS_BUILD == 'true'
         # The selective lane runs `--label macos`; a `test-osx-*` without the label
         # would ship in the bundle and never execute anywhere. Red here, on Linux.
         run: python3 ci/check_macos_labels.py bundle/tests.json
       - name: The manifest must carry no absolute path
+        if: env.RUN_MACOS_BUILD == 'true'
         # bundle_tests.py already refuses these; this is the independent check, because
         # the whole portability claim rests on it and this is the first phase where the
         # bundle leaves the machine that built it.
@@ -335,11 +352,13 @@ jobs:
           python3 -c "import json,sys; d=json.load(open('bundle/tests.json')); print(len(d['tests']), 'tests')"
           ls bundle | grep -q '\.dylib$'
       - name: Pack the bundle
+        if: env.RUN_MACOS_BUILD == 'true'
         # tar, not a plain artifact upload: upload-artifact@v4 drops the executable bit
         # and does not preserve symlinks, and this bundle needs both (every test exe, and
         # the libmimalloc.dylib -> libmimalloc.3.dylib SONAME chain).
         run: tar -C bundle -czf "${{ matrix.bundle }}.tar.gz" .
       - uses: actions/upload-artifact@v4
+        if: env.RUN_MACOS_BUILD == 'true'
         with:
           name: bundle-${{ matrix.bundle }}
           path: ${{ matrix.bundle }}.tar.gz
@@ -348,7 +367,8 @@ jobs:
 
   build-rust-apple:
     needs: resolve-candidate
-    # Ungated. The golden-image / unattended-install question (#277, #283) that this
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full'))
+    # The golden-image / unattended-install question (#277, #283) that this
     # lane was parked behind is settled by not needing an installed macOS at all: the
     # x86_64 bundles execute in macOS Recovery, booted off the image on an ordinary
     # Linux runner, so there is nothing to install, cache, or keep alive. The
@@ -500,25 +520,29 @@ jobs:
   decide:
     needs: resolve-candidate
     name: decide (selective macOS lane)
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
-      run: ${{ steps.decide.outputs.run }}
+      run: ${{ steps.decide.outputs.run || steps.no-pr.outputs.run }}
       reason: ${{ steps.decide.outputs.reason }}
     steps:
       - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
           fetch-depth: 0
       - id: decide
+        if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
           python3 ci/macos_lane_decide.py \
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}" \
             --labels "${{ join(github.event.pull_request.labels.*.name, ',') }}"
+      - id: no-pr
+        if: github.event_name != 'pull_request'
+        run: echo 'run=false' >> "$GITHUB_OUTPUT"
       - run: |
-          echo "### selective macOS lane: run=${{ steps.decide.outputs.run }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### selective macOS lane: run=${{ steps.decide.outputs.run || steps.no-pr.outputs.run }}" >> "$GITHUB_STEP_SUMMARY"
           echo "${{ steps.decide.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
 
   run-macos-x64-selective:

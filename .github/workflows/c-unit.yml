@@ -51,6 +51,7 @@ on:
   push:
     branches: [main, v4]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     # No `paths` filter (#360): every job here is a required status check on `main`, and a
     # filtered workflow never reports on a PR outside its paths, leaving that PR BLOCKED.
 
@@ -109,6 +110,7 @@ jobs:
   build:
     name: build (${{ matrix.config }})
     needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
     timeout-minutes: 30
@@ -387,6 +389,7 @@ jobs:
   build-bun-objects:
     name: build-bun-objects (${{ matrix.name }})
     needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
     timeout-minutes: 20
@@ -435,6 +438,7 @@ jobs:
   # compiled once and the result is what gets executed -- not to weaken it.
   build-windows-native:
     needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: windows-latest
     timeout-minutes: 40
     defaults:
@@ -904,6 +908,7 @@ jobs:
   # that had gone blind fails here rather than reporting "identical" forever.
   fastpath-identity:
     needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -930,6 +935,7 @@ jobs:
   isa-baseline-arm64:
     name: isa-baseline (ubuntu-24.04-arm)
     needs: resolve-candidate
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full')))
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
