@@ -194,6 +194,176 @@ The two pairs were measured on the same machine but are separate runs with diffe
 selection rules — median of 3 for the off-vs-on pair, best of 3 for the
 cross-allocator pair — and neither is rendered from the other's data.
 
+## Explicit empty-arena reclamation experiment (#438)
+
+This is a separate experiment from the idle-churn chart. Its scattered survivors
+keep arenas nonempty, whereas `MI_PURGE_RECLAIM` can release only completely free,
+allocator-created arenas. The comparison measures the *additional* effect of an
+explicit reclaim after an ordinary forced purge, plus the cost of allocating into
+arenas again. Reclaim is opt-in; neither ordinary/forced purge nor the idle and
+background paths enable it by default. The owner directive in
+[#438](https://github.com/zackees/mimalloc-pprof/issues/438) rules out changing
+that default under this work.
+
+[`ci/bench_arena_reclaim.py`](../ci/bench_arena_reclaim.py) builds and drives the
+standalone [`bench_arena_reclaim.c`](../ci/bench_arena_reclaim.c) workload. The
+workflow checks out the comparison baseline at
+[`d5bdb464debf59d0816eeac038d9d4423736c9c4`](https://github.com/zackees/mimalloc-pprof/commit/d5bdb464debf59d0816eeac038d9d4423736c9c4),
+after the opt-in implementation merged, and builds it with the same benchmark
+source. Thus the baseline is a pinned prior implementation, not an upstream
+allocator or a pre-reclaim build. Both revisions run `purge-only` and `reclaim`
+arms; each comparison *within* a revision uses the same build and workload.
+`retained-id` runs only on the fixed branch because the baseline predates its
+caller-owned-arena fix. Do not infer a safe baseline behavior from its absence.
+
+From the measured source revision, a local Linux reproduction is:
+
+```bash
+git worktree add --detach ../mimalloc-pprof-438-main d5bdb464debf59d0816eeac038d9d4423736c9c4
+python3 ci/bench_arena_reclaim.py --measure --toolchain unix --build-root /tmp/arena-reclaim-pr --data /tmp/arena-reclaim-linux-pr.json --runs 3
+python3 ci/bench_arena_reclaim.py --measure --toolchain unix --build-root /tmp/arena-reclaim-main --allocator-source ../mimalloc-pprof-438-main --allocator-source-sha d5bdb464debf59d0816eeac038d9d4423736c9c4 --data /tmp/arena-reclaim-linux-main.json --runs 3
+python3 ci/bench_arena_reclaim.py --render --data .github/assets/arena-reclaim-linux-pr.json --out-dir .github/assets
+python3 ci/bench_arena_reclaim.py --check --data .github/assets/arena-reclaim-linux-pr.json --out-dir .github/assets
+```
+
+Replace `--toolchain unix` with `msvc` (native Microsoft `cl`) or `mingw`
+(MSYS2 MINGW64) on Windows. The exact CI commands and pinned checkout are in
+[`benchmark-arena-reclaim.yml`](../.github/workflows/benchmark-arena-reclaim.yml),
+which can also be dispatched manually. The output JSON records each child
+command and all build flags; the last two commands render and verify the
+committed Linux figures byte-for-byte without rerunning the measurements.
+
+The workload sets the arena-reserve option to 32 MiB, then allocates and
+touches eight 32 MiB objects (one byte per 4 KiB page) in each of two waves.
+Each wave records `peak`,
+`free`, ordinary `mi_purge_all_ex(MI_PURGE_FORCE, 100, ...)`, then either
+`mi_purge_all_ex(MI_PURGE_FORCE | MI_PURGE_RECLAIM, 100, ...)` or an aligned
+no-op checkpoint. The second peak measures re-growth. In the `empty` scenario
+all eight objects are freed before purge; in `nonempty` they remain live until
+after the checkpoint, preventing their arenas from qualifying. The fixed-branch
+`retained-id` scenario keeps a public, nonexclusive reservation and verifies its
+area and ID still resolve after reclaim. A separate 64-byte allocation keeps
+ordinary process activity outside the large-object arenas.
+
+The matrix crosses `MI_OWNER_GATE=OFF/ON`,
+`MIMALLOC_PURGE_DECOMMITS=0/1` (reset versus decommit), and no worker, a
+cooperatively parked idle worker, or an active worker continuously allocating
+and freeing. The idle worker uses `mi_on_thread_idle_start()`/`end()`; the
+active worker tests admission under concurrent allocator use. The benchmark
+sets `MI_PPROF=OFF` and uses Release static builds. Its manual artifact workflow
+collects Linux, native Windows MSVC `cl`, and Windows MinGW-w64 runs. Each cell
+has at least three paired repetitions; arm order alternates by repetition to
+reduce order effects, and no run is discarded. The workload is deterministic
+(`seed: 0`, no random operation stream). Raw JSON records source and allocator
+SHAs, benchmark-source digests, host/toolchain details, build flags, command,
+workload size, every sample, and the paired repetition index.
+
+Selection is the median for each arm and phase. Incremental memory effects and
+re-growth cost are medians of the *within-repetition* purge-only minus reclaim
+differences, rather than a subtraction of independently selected best runs. The
+two figures use the `MI_OWNER_GATE=OFF`, decommit-on, `empty`, no-worker cell;
+the complete matrix remains in the raw JSON. The phase chart plots process RSS
+through both waves. The tradeoff chart shows additional RSS, private-memory and
+allocator-commit reductions, reclaim-call time, and extra second-wave allocation
+time. It shows the allocator-reported released reservation separately. The
+renderer annotates no-eligible and active-worker pending counts; raw rows also
+distinguish `purge-busy`, `arena-layer-busy`, `pending-subprocess`,
+`no-eligible-arena`, and `released`. A completed pass with zero eligible arenas
+is a valid no-op, not an omitted measurement. Call duration is measured around
+the API and re-growth duration around the next eight allocations and touches;
+these are synthetic pause and re-growth costs, not application tail latency.
+
+RSS (Windows working set) and private bytes are process measures; allocator
+`committed` and metadata are allocator accounting; Linux `VmSize` is process
+virtual address space. The Windows process-virtual field is unavailable and
+must not be read as zero usage. `arena_reclaim_bytes` counts *reserved virtual
+address space* returned to the OS. Ordinary purge may already have decommitted
+most data pages, so a large reservation drop can correspond to a much smaller
+physical-memory or committed-memory drop. Compare the reclaim checkpoint with
+the already purged control when discussing savings. These observations establish
+costs and effects for this workload; they do not by themselves prove safety in
+every application.
+
+| Policy | Tradeoff and decision |
+|---|---|
+| Explicit opt-in at a caller-chosen quiescent point | Chosen policy. The caller requests `MI_PURGE_RECLAIM` only when it can arrange a suitable pause or idle handoff and can inspect `reclaimed`, `arenas_reclaimed`, `arenas_kept`, and `subprocs_pending`. It pays the measured synchronous call and possible re-growth cost only at that point. Public caller-managed arenas and retained IDs must survive; the fixed-branch scenario checks one such ID. |
+| Implicit reclaim during ordinary or forced purge | Would surprise existing callers with a possible pause and subsequent re-reservation cost. A forced purge does not itself prove other threads are quiescent. It also broadens exposure to retained-ID hazards. Not enabled. |
+| Automatic, background, or idle-triggered reclaim | Could return address space without an explicit call, but the allocator would need a reliable quiescence protocol plus thresholds/hysteresis to avoid reclaim/re-reserve churn. Such a policy would make stalls and memory behavior workload-dependent and cannot assume that an idle notification makes every owner safe. Not enabled. |
+
+Matching headers and library artifacts are required by this project, so a
+mixed-version C ABI is not a policy requirement here. Same-build C/Rust layout
+and memory-safety checks still matter; in particular, returning a caller-owned
+arena while its ID is retained would be a use-after-free. The opt-in choice is
+not a claim that every reclaim request will run: pending owners, an in-flight
+purge, a busy arena layer, and a lack of eligible arenas are distinct outcomes.
+Any proposal to enable reclamation by default needs a new owner decision.
+
+### Measured results (three paired repetitions per row)
+
+The benchmark source is [`10521b6c`](https://github.com/zackees/mimalloc-pprof/commit/10521b6cf6a3c4218e17acd5cae36bb2dc1d24e4);
+the comparison allocator is the pinned `d5bdb464` revision above. These rows
+use the decommit-on, ungated, empty-arena, no-worker cell plotted in the two
+figures. “Ordinary RSS” is the peak-to-ordinary-purge drop in the reclaim arm;
+all other memory reductions compare the paired purge-only and reclaim arms at
+the *later* reclaim checkpoint. “Re-growth extra” is the paired second-wave
+allocation-and-touch time in the reclaim arm minus the purge-only arm; a small
+negative number is within measurement noise, not a speedup claim.
+
+| Raw result | Ordinary RSS ↓ MiB | Extra RSS ↓ MiB | Extra private ↓ MiB | Extra allocator commit ↓ MiB | VA reservation released MiB | Reclaim call median / max ms | Re-growth extra ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| [Linux, fixed branch](../.github/assets/arena-reclaim-linux-pr.json) | 256.22 | 15.93 | 15.96 | 256.44 | 768 | 0.224 / 0.236 | +1.591 |
+| [Linux, pinned main](../.github/assets/arena-reclaim-linux-main.json) | 256.22 | 15.97 | 15.97 | 256.50 | 768 | 0.216 / 0.217 | +0.994 |
+| [Windows native `cl`, fixed branch](../.github/assets/arena-reclaim-msvc-pr.json) | 255.98 | 0.05 | 2.05 | 2.00 | 768 | 0.146 / 0.153 | +0.015 |
+| [Windows native `cl`, pinned main](../.github/assets/arena-reclaim-msvc-main.json) | 255.98 | 0.04 | 2.07 | 2.00 | 768 | 0.124 / 0.127 | −0.169 |
+| [Windows MinGW-w64, fixed branch](../.github/assets/arena-reclaim-mingw-pr.json) | 255.98 | 0.02 | 2.02 | 2.00 | 768 | 0.132 / 0.135 | +0.274 |
+| [Windows MinGW-w64, pinned main](../.github/assets/arena-reclaim-mingw-main.json) | 255.98 | 0.03 | 1.98 | 1.94 | 768 | 0.139 / 0.144 | +0.025 |
+
+The fixed branch also released **2.00 MiB of allocator metadata** in this
+cell on each platform. The 768 MiB figure is released *virtual reservation*,
+not a physical-memory saving. With decommit enabled, ordinary purge already
+returned roughly 256 MiB of resident memory. The additional observed process
+RSS reduction was about 16 MiB on Linux but only 0.02–0.05 MiB on these
+Windows runners; Windows private committed memory fell by about 2 MiB. Linux
+allocator `committed` accounting fell by about 256 MiB on reclaim while RSS
+fell by about 16 MiB, so that counter must not be presented as physical RSS.
+The fixed branch and pinned main have similar synthetic results; this is not
+evidence that the unsafe baseline retained-ID behavior is acceptable.
+
+The reset (`MIMALLOC_PURGE_DECOMMITS=0`) cell changes the economics: after the
+ordinary purge, the fixed-branch reclaim checkpoint reduced process RSS by a
+median **271.97 MiB on Linux**, **256.03 MiB with native MSVC**, and
+**256.02 MiB with MinGW-w64**, at median synchronous call times of **1.179,
+7.242, and 7.291 ms** respectively. Those figures are within-arm before/after
+differences, not paired incremental-control differences, and do not generalize
+to an application that already decommits or has live objects in the arenas.
+
+The active-thread, ungated cell requested reclaim in all three repetitions
+on each platform and got `pending-subprocess` each time: **zero arenas
+released**, with a median call near the configured **100 ms owner-acquisition
+wait** (99.3–99.5 ms). The cooperative-idle cell released arenas in all three
+runs. With `MI_OWNER_GATE=ON`, the active-thread cell also released arenas in
+all three runs; that build carries the separately measured allocation fast-path
+cost in [the process-wide purge study](purge-all.md). These controls are the
+practical reason a caller must inspect the report and choose its own
+quiescent point. Results come from three GitHub-hosted runs per cell on
+Linux 6.17 Azure and Windows Server 2025 (native `cl` and MSYS2 MINGW64);
+the exact runner names, CPU identities, flags, and all raw samples are in the
+linked JSON. The three toolchain jobs are distinct machines, not a
+cross-toolchain speed ranking.
+
+This favors explicit opt-in for the present implementation: a caller can pay
+the measured pause and re-growth cost only after a known burst and can retry
+or skip when owners are pending. Implicit reclaim would put a potential
+100 ms no-op wait into otherwise ordinary forced purges under an active
+ungated worker. An automatic policy could win in a service with long, reliably
+quiescent phases and a sustained large metadata/VA burden, but only with a
+proven safe admission protocol and a threshold/cooldown that exceeds the
+measured re-growth cost; these three synthetic repetitions do not identify a
+generally valid threshold. An implicit policy might make sense only for an
+application that already treats *every* forced purge as a quiescent,
+potentially blocking maintenance point. Neither alternative is enabled or
+authorized as a default by this issue.
+
 ## Pending Phase 6 panels
 
 The following metrics are tracked in the dashboard as explicitly pending

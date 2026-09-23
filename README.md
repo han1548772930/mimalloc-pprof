@@ -104,6 +104,7 @@ image and the table below are rendered from.
 | Background purge thread | ✅ on by default | ❌ purge waits for a malloc | ✅ on by default | ⚠️ off by default |
 | Time-delayed / decaying purge | ✅ purge_delay 100 ms | ✅ purge_delay 1000 ms | ✅ purge_delay 100 ms | ✅ dirty_decay_ms 10 s |
 | RSS returned after 10 s idle (churn) | 74 % | 0 % (18 % w/ mi_collect) | 74 % | 0 % (74 % if asked) |
+| Explicit empty-arena reclaim (opt-in) | ✅ MI_PURGE_RECLAIM | ❌ no runtime reclaim API | ❌ no runtime reclaim API | ⚠️ manual per-arena destroy |
 | **Profiling and observability** | | | | |
 | pprof-compatible sampled heap profiler | ✅ compile + runtime opt-in | ❌ none at all | ✅ runtime opt-in | ✅ build-time --enable-prof |
 | Heap profiler on Windows | ✅ MSVC and MinGW | ❌ no profiler | ⚠️ frames, no module map | ⚠️ not MSVC; MinGW untested |
@@ -1221,18 +1222,99 @@ option with a measured fast-path cost. Contract and numbers:
 [docs/purge-all.md](docs/purge-all.md); implementation:
 [#366](https://github.com/zackees/mimalloc-pprof/issues/366).
 
-One more piece of memory return is behind the same call:
-`mi_purge_all_ex(flags | MI_PURGE_RECLAIM)`
-(see [docs/arena-reclaim.md](docs/arena-reclaim.md)) gives back the arenas that are **completely
+One more piece of memory return is available through an **explicit opt-in** call:
+`mi_purge_all_ex(MI_PURGE_FORCE | MI_PURGE_RECLAIM, ...)`
+(see [docs/arena-reclaim.md](docs/arena-reclaim.md)) gives back allocator-owned arenas that are **completely
 free**, their metadata included. That is the part a service keeps after a spike: an arena's
 `pages_meta` is one `mi_page_t` per slice — 2.8 MiB per GiB of arena — committed when the
 arena is created, and nothing else in the library returns it before the process exits; the
 peak's arenas stay committed until a restart. Releasing one requires proof that
 every thread of the sub-process is out of the allocator at the same instant — the same park
 protocol the purge uses, claimed all at once — so a busy sub-process is reported in
-`subprocs_pending` and simply not reclaimed; the call never blocks and never waits on a lock
-it holds. Ungated builds reclaim from parked threads; `MI_OWNER_GATE=ON` reclaims as soon as
+`subprocs_pending` and simply not reclaimed. The call may spend its `wait_ms` budget
+trying to claim owners, but never waits while holding the arena lock. Ungated builds
+reclaim from parked threads; `MI_OWNER_GATE=ON` reclaims as soon as
 no allocator call is in flight.
+
+### Empty-arena reclaim: measured benefit and cost
+
+The dedicated [peak → free → ordinary purge → explicit reclaim → re-growth
+experiment](docs/benchmarks.md#explicit-empty-arena-reclamation-experiment-438)
+measures what this flag adds *after* ordinary purge has already done its work. Its
+Linux figure shows process RSS, not virtual reservation; the second figure shows
+paired incremental memory reductions beside call and re-growth time. The orange
+line is the same build and workload with no reclaim request. No-op and pending
+conditions are labelled in the figures and retained in the raw data.
+
+![Process RSS through two peak, free, purge, and reclaim waves; purge-only control beside explicit reclaim](.github/assets/arena-reclaim-timeline.svg)
+
+![Incremental physical and committed memory savings, virtual reservation separately, and reclaim and re-growth costs](.github/assets/arena-reclaim-tradeoff.svg)
+
+Both figures render deterministically from the [raw Linux paired
+results](.github/assets/arena-reclaim-linux-pr.json). The
+[full methodology and Linux/MSVC/MinGW results](docs/benchmarks.md#explicit-empty-arena-reclamation-experiment-438)
+give build/source pins, host details, all repetitions, reset and decommit
+settings, and active-versus-idle-thread controls. A large decrease in
+`arena_reclaim_bytes` is **virtual address space**, not an equal RSS saving.
+In the plotted decommit-on cell (three paired repetitions), ordinary purge
+had already reduced peak RSS by **256.22 MiB** on Linux. Explicit reclaim
+then saved an additional **15.93 MiB RSS** and **2.00 MiB allocator metadata**,
+while releasing **768 MiB of virtual reservation**; its median call took
+**0.224 ms** and the next allocation wave took **1.591 ms longer** than its
+paired purge-only control. On these Windows runners the additional RSS effect
+was only **0.05 MiB** (native MSVC) and **0.02 MiB** (MinGW-w64), though
+private committed memory fell by about **2 MiB**. Those are synthetic
+measurements, not an application-wide savings guarantee. With reset instead
+of decommit, reclaim returned much more physical memory, but the native
+Windows median call rose to **7.242 ms**. An active worker in an ungated build
+made all three requests per platform wait roughly **100 ms** and release
+nothing; cooperative idle or an owner-gated build let the pass run.
+
+Call reclaim only at a chosen quiescent point, such as after a burst has freed
+whole arenas and workers have handed off with `mi_on_thread_idle_start()`.
+With `MI_OWNER_GATE=ON`, threads can be claimed while they are outside
+allocator calls, but that build option has a separate fast-path cost.
+Reclamation is **never implicit** in `mi_purge_all()`, ordinary forced purge,
+the background scavenger, or idle hooks.
+
+For C callers, request the flag and inspect the report rather than assuming a
+request released memory:
+
+```c
+#include <mimalloc.h>
+#include <stdio.h>
+
+mi_purge_all_report_t report = {0};
+int status = mi_purge_all_ex((mi_purge_flags_t)(MI_PURGE_FORCE | MI_PURGE_RECLAIM),
+                             100, &report);
+if (status != MI_PURGE_BUSY) {  // busy means another purge was in flight; nothing ran
+  printf("pass ran=%d arenas released=%zu kept=%zu subprocs pending=%zu\n",
+         (int)report.reclaimed, report.arenas_reclaimed,
+         report.arenas_kept, report.subprocs_pending);
+}
+```
+
+For Rust callers, the same opt-in is always present in the API (no cargo
+feature is needed):
+
+```rust
+use mimalloc_pprof::{purge_all_ex, PurgeFlags, PurgeStatus};
+
+let (status, report) = purge_all_ex(PurgeFlags::FORCE_RECLAIM, 100);
+if status != PurgeStatus::Busy {
+    // `reclaimed` says the pass ran; `arenas_reclaimed` says what it released.
+    println!("ran={} released={} kept={} pending={}", report.reclaimed,
+             report.arenas_reclaimed, report.arenas_kept, report.subprocs_pending);
+}
+```
+
+`subprocs_pending > 0` means at least one sub-process could not be claimed, so
+its arenas were not released in that call; `arenas_kept` includes free public
+reserve/manage arenas, even non-exclusive ones. A public arena ID remains valid
+after reclaim because the entire public reservation is retained for the
+process lifetime—there is no public unpin operation. A successful pass can
+still release zero arenas when none are eligible. `wait_ms` bounds attempts to
+claim owners, **not** the work or OS calls after a claim succeeds.
 
 ---
 
