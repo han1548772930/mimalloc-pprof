@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -27,13 +28,13 @@ FULL_ROOTS = {
 }
 
 
-def workflow(filename: str) -> dict:
+def workflow(filename: str) -> dict[Any, Any]:
     return yaml.safe_load((WORKFLOWS / filename).read_text(encoding="utf-8"))
 
 
-def events(document: dict) -> dict:
+def events(document: dict[Any, Any]) -> dict[Any, Any]:
     # YAML 1.1 treats GitHub Actions' `on` key as a boolean.
-    return document.get("on", document.get(True))
+    return document["on"] if "on" in document else document[True]
 
 
 def test_full_workflows_recompute_on_labels_even_for_docs_only_prs() -> None:
