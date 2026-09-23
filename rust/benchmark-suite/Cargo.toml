@@ -47,6 +47,10 @@ name = "benchmark-scaling-validate"
 path = "src/bin/benchmark-scaling-validate.rs"
 
 [[bin]]
+name = "benchmark-scaling-merge"
+path = "src/bin/benchmark-scaling-merge.rs"
+
+[[bin]]
 name = "benchmark-pprof-tax-run"
 path = "src/bin/benchmark-pprof-tax-run.rs"
 

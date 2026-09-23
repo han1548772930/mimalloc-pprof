@@ -44,6 +44,8 @@ struct Options {
     initial_operations: u64,
     topology: Option<Topology>,
     reduced_smoke: bool,
+    shard_index: usize,
+    shard_count: usize,
 }
 
 pub fn benchmark_scaling_run_main() -> Result<(), String> {
@@ -225,8 +227,10 @@ fn run(options: Options) -> Result<(), String> {
     std::fs::create_dir_all(&request_dir)
         .map_err(|error| format!("create scaling request dir: {error}"))?;
 
+    let shard_thread_points =
+        crate::scaling::scaling_thread_points_for_shard(options.shard_index, options.shard_count)?;
     for pattern in SCALING_PATTERNS {
-        for thread_count in SCALING_THREAD_POINTS {
+        for thread_count in shard_thread_points.iter().copied() {
             let template = ScalingChildRequest {
                 protocol_version: SCALING_CHILD_PROTOCOL_VERSION.into(),
                 metric_schema_version: SCALING_SCHEMA_VERSION.into(),
@@ -406,7 +410,7 @@ fn run(options: Options) -> Result<(), String> {
     }
     let raw = ScalingRawRun {
         metric_schema_version: SCALING_SCHEMA_VERSION.into(),
-        status: if options.reduced_smoke {
+        status: if options.reduced_smoke || options.shard_count > 1 {
             "incomplete"
         } else {
             "complete"
@@ -421,14 +425,14 @@ fn run(options: Options) -> Result<(), String> {
         calibrations,
         samples,
     };
-    if !options.reduced_smoke {
+    if !options.reduced_smoke && options.shard_count == 1 {
         validate_scaling_raw_run(&raw)?;
     }
     write_new_json(options.output_dir.join("scaling-raw-run.json"), &raw)?;
     println!(
         "PASS scaling sweep: {} raw records across {} cells; projected runtime {:.1}s",
         raw.samples.len(),
-        SCALING_PATTERNS.len() * SCALING_THREAD_POINTS.len(),
+        SCALING_PATTERNS.len() * shard_thread_points.len(),
         projected_full_seconds
     );
     Ok(())
@@ -453,6 +457,8 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
     let mut physical_cores = None;
     let mut logical_cores = None;
     let mut reduced_smoke = false;
+    let mut shard_index = 0usize;
+    let mut shard_count = 1usize;
     let mut index = 0;
     while index < arguments.len() {
         let flag = arguments[index].as_str();
@@ -462,7 +468,7 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
             continue;
         }
         if flag == "--help" || flag == "-h" {
-            println!("usage: benchmark-scaling-run (--provenance <allocator-provenance.json> | --build-root <dir>) --output-dir <new-dir> [--blocks 3] [--run-seed N] [--timeout-secs N] [--warmup-operations N] [--initial-operations N] [--physical-cores N] [--logical-cores N] [--reduced-smoke]");
+            println!("usage: benchmark-scaling-run (--provenance <allocator-provenance.json> | --build-root <dir>) --output-dir <new-dir> [--blocks 3] [--run-seed N] [--timeout-secs N] [--warmup-operations N] [--initial-operations N] [--physical-cores N] [--logical-cores N] [--shard-index N] [--shard-count N] [--reduced-smoke]");
             std::process::exit(0);
         }
         let value = arguments
@@ -485,6 +491,8 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
             }
             "--physical-cores" => physical_cores = Some(parse_number("--physical-cores", value)?),
             "--logical-cores" => logical_cores = Some(parse_number("--logical-cores", value)?),
+            "--shard-index" => shard_index = parse_number("--shard-index", value)?,
+            "--shard-count" => shard_count = parse_number("--shard-count", value)?,
             _ => return Err(format!("unknown argument: {flag}")),
         }
         index += 2;
@@ -495,6 +503,7 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
     if initial_operations == 0 {
         return Err("--initial-operations must be non-zero".into());
     }
+    crate::scaling::scaling_thread_points_for_shard(shard_index, shard_count)?;
     if provenance.is_some() && build_root.is_some() {
         return Err("pass either --provenance or --build-root, not both".into());
     }
@@ -519,6 +528,8 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
         initial_operations,
         topology,
         reduced_smoke,
+        shard_index,
+        shard_count,
     })
 }
 
