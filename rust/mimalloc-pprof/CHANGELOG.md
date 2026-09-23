@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **Free arenas can be given back**:
+  `PurgeFlags::RECLAIM` / `PurgeFlags::FORCE_RECLAIM` (C: `MI_PURGE_RECLAIM`) makes
+  `purge_all_ex` also release the arenas that are **completely free**, their metadata
+  included — the `mi_page_t` table an arena keeps for its whole life once it has been
+  created, which is why a service that has spiked keeps the metadata of its peak. It
+  requires every thread of the sub-process to be out of the allocator at the same instant
+  (the #366 park protocol, claimed all at once) and reports a sub-process where that fails
+  in the new `PurgeAllReport::subprocs_pending`; `PurgeAllReport::reclaimed` says whether
+  the pass ran and `arenas_reclaimed` / `arena_reclaim_bytes` what it returned. Nothing
+  changes without the flag. Full description: `docs/arena-reclaim.md` in the C tree.
+
 ## 1.0.0
 
 First stable release of the v3-based crate.

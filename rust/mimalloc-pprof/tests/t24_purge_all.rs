@@ -92,3 +92,42 @@ fn purge_all_convenience_form() {
     assert_eq!(report.gated, cfg!(feature = "owner-gate"));
     drop(held);
 }
+
+/// The flag and the phase F report fields. What the reclaim actually releases
+/// is asserted in C (`test/test-arena-reclaim.cpp`, docs/arena-reclaim.md): it needs
+/// platform-sized arenas, and this crate's unit tests must not depend on the reservation
+/// granularity of the machine they run on. Here the flag only has to reach
+/// `mi_purge_all_ex`, keep the call out of `Busy`, and keep the report self-consistent.
+#[test]
+fn purge_all_reclaim_flag() {
+    let _serial = ONE_PURGE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let held = churn();
+
+    let (status, report) =
+        mimalloc_pprof::purge_all_ex(mimalloc_pprof::PurgeFlags::FORCE_RECLAIM, 100);
+    assert_ne!(status, mimalloc_pprof::PurgeStatus::Busy, "{report:?}");
+    // `reclaimed` is "the pass ran": nothing may be reported pending, and bytes may only
+    // be reported for arenas that were counted.
+    if report.reclaimed {
+        assert_eq!(report.subprocs_pending, 0, "{report:?}");
+    }
+    if report.arenas_reclaimed == 0 {
+        assert_eq!(report.arena_reclaim_bytes, 0, "{report:?}");
+    }
+
+    // The positive control: the same call without the flag releases no arena, whatever
+    // quiescence it did or did not find.
+    let (status, plain) =
+        mimalloc_pprof::purge_all_ex(mimalloc_pprof::PurgeFlags::FORCE, 100);
+    assert_ne!(status, mimalloc_pprof::PurgeStatus::Busy, "{plain:?}");
+    assert!(!plain.reclaimed, "{plain:?}");
+    assert_eq!(plain.arenas_reclaimed, 0, "{plain:?}");
+    assert_eq!(plain.arena_reclaim_bytes, 0, "{plain:?}");
+
+    // still usable afterwards
+    drop(held);
+    let after: Vec<u8> = vec![7u8; 1 << 14];
+    assert_eq!(after[0], 7);
+}

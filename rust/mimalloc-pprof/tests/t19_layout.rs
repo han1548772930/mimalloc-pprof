@@ -251,6 +251,11 @@ fn purge_all_report_matches_c() {
             theaps_orphaned,
             gated,
             complete,
+            arenas_reclaimed,
+            arena_reclaim_bytes,
+            arenas_kept,
+            subprocs_pending,
+            reclaimed,
         ),
     );
     check(&c, layout!("mi_purge_flags_t", sys::mi_purge_flags_t));
@@ -438,6 +443,7 @@ fn versions_and_constants_match_c() {
         ("const:MI_MEMORY_RESIZE", sys::MI_MEMORY_RESIZE as usize),
         ("const:MI_MEMORY_CHANGE_COUNT", sys::MI_MEMORY_CHANGE_COUNT),
         ("const:MI_PURGE_FORCE", sys::MI_PURGE_FORCE as usize),
+        ("const:MI_PURGE_RECLAIM", sys::MI_PURGE_RECLAIM as usize),
         ("const:MI_PURGE_OK", sys::MI_PURGE_OK as usize),
         ("const:MI_PURGE_PARTIAL", sys::MI_PURGE_PARTIAL as usize),
         ("const:MI_PURGE_BUSY", sys::MI_PURGE_BUSY as usize),
