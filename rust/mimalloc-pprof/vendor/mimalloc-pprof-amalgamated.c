@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 297bd140 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 048d6202 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -27525,30 +27525,23 @@ static bool mi_arena_reclaim_one(mi_subproc_t* subproc, size_t idx, mi_arena_t* 
 }
 
 /* -----------------------------------------------------------
-  Per-heap tracking of a released arena
+  Per-heap tracking of an empty arena
 ----------------------------------------------------------- */
 
-// Every non-main heap of the sub-process may still hold an `arena_pages[idx]` for an arena that
-// is now gone: `mi_heap_ensure_arena_pages` allocated it the first time the heap put a page in
-// that arena, and only `mi_heap_free` would ever free it (heap.c -> `_mi_arena_pages_free`).
-// Leaving it in place would be a latent corruption: slot `idx` can be recycled by
-// `mi_arenas_add` for a *different*, larger arena, and the next
-// `mi_bitmap_setN(arena_pages->pages, slice_index, ...)` in that arena writes past the end of a
-// bitmap that was sized for the old `slice_count`.
-//
-// A slot whose arena is NULL can only be such a leftover: every writer of
-// `heap->arena_pages[i]` first had the arena at slot `i` (`mi_heap_ensure_arena_pages` is
-// called with an arena found in the table), and both are cleared together here. The pass is
-// safe without `theap_meta_lock` -- `mi_arena_pages_free_abandoned` frees raw-OS chunks and
-// `_mi_free_subproc_safe` may collect, i.e. it may take `theap_meta_lock` itself -- because the
-// claims keep every other thread out of `mi_heap_ensure_arena_pages` and out of `mi_heap_free`.
+// Detach non-main heaps' empty tracking BEFORE an arena slot can shrink or be reused.
+// All registered owners are claimed and heaps_lock keeps the heap list stable. A new
+// thread can still allocate from the main/meta heap; it cannot populate these other heaps.
+// Free outside theap_meta_lock (_mi_free_subproc_safe may take it), then recheck emptiness
+// under that lock before releasing arenas. This also prevents a new arena from inheriting
+// a bitmap sized for the old occupant of its slot.
 static void mi_arena_reclaim_release_heap_pages(mi_subproc_t* subproc, mi_heap_t* heap_main)
 {
   const size_t count = mi_arenas_get_count(subproc);
   for (mi_heap_t* heap = subproc->heaps; heap != NULL; heap = heap->next) {
     if (heap == heap_main) continue;   // handled per arena (`&arena->pages_main`), and it never allocates one
     for (size_t i = 0; i < count; i++) {
-      if (mi_atomic_load_ptr_acquire(mi_arena_t, &subproc->arenas[i]) != NULL) continue;
+      mi_arena_t* const arena = mi_atomic_load_ptr_acquire(mi_arena_t, &subproc->arenas[i]);
+      if (arena == NULL || !mi_arena_reclaim_is_ours(arena) || !mi_arena_reclaim_is_empty(arena)) continue;
       mi_arena_pages_t* arena_pages = mi_atomic_load_ptr_acquire(mi_arena_pages_t, &heap->arena_pages[i]);
       if (arena_pages == NULL) continue;
       // Detach under the heap's own lock, then free. `mi_heap_ensure_arena_pages` publishes
@@ -27635,20 +27628,19 @@ static bool mi_arena_reclaim_subproc(mi_subproc_t* sp, mi_tld_t* my_tld, mi_aren
 
   bool complete = false;
   // Fork order 2 -> 4 -> 7 (src/fork.c): the heap list, the tld registry and the meta theap.
-  // `heaps_lock` also keeps `sp->heaps` stable for the second pass below.
+  // `heaps_lock` also keeps `sp->heaps` stable for the tracking cleanup.
   mi_lock(&sp->heaps_lock) {
     mi_lock(&sp->tlds_lock) {
       if (mi_arena_reclaim_claim_all(sp, my_tld)) {
         complete = true;
+        mi_heap_t* const heap_main = mi_atomic_load_ptr_acquire(mi_heap_t, &sp->heap_main);
+        mi_arena_reclaim_release_heap_pages(sp, heap_main);
         mi_lock(&sp->theap_meta_lock) {
           for (size_t i = 0; i < count; i++) {
             mi_arena_t* const arena = mi_atomic_load_ptr_acquire(mi_arena_t, &sp->arenas[i]);
             if (arena != NULL) { (void)mi_arena_reclaim_one(sp, i, arena, rep); }
           }
         }
-        // The slots of everything we released are NULL by now; hand the per-heap leftovers back.
-        mi_heap_t* const heap_main = mi_atomic_load_ptr_acquire(mi_heap_t, &sp->heap_main);
-        mi_arena_reclaim_release_heap_pages(sp, heap_main);
         mi_arena_reclaim_release_all(sp);
       }
     }
