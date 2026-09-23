@@ -369,12 +369,54 @@ static void run_parked_thread_row(void) {
 
 // ---------------------------------------------------------------------------------------------
 
-int main(void) {
+// Run in a fresh process so the user heap's arena is the final slot.
+static void run_heap_reuse_row(void) {
+  printf("[A7] a user heap can reuse a reclaimed tail slot for a larger arena\n");
+  mi_option_set(mi_option_arena_reserve, (long)ARENA_RESERVE_KIB);
+  void* keep = mi_malloc(64);
+  mi_heap_t* heap = mi_heap_new();
+  void* p = mi_heap_malloc(heap, BIG_BYTES);
+  if (p == NULL) { check(false, "A7: heap allocation succeeded"); return; }
+  mi_arena_t* arena = _mi_safe_ptr_page(p)->memid.mem.arena.arena;
+  const size_t idx = arena->arena_idx;
+  const size_t old_slices = arena->slice_count;
+  check(idx + 1 == mi_atomic_load_acquire(&heap->subproc->arena_count), "A7: the user heap occupies the tail arena");
+  mi_free(p);
+  mi_heap_collect(heap, true);
+  const mi_purge_all_report_t rep = reclaim_all();
+  check(rep.reclaimed && rep.arenas_reclaimed > 0, "A7: the empty arena was reclaimed");
+  check(mi_atomic_load_ptr_acquire(mi_arena_t, &heap->subproc->arenas[idx]) == NULL,
+        "A7: the old arena slot is empty");
+  const bool detached = (mi_atomic_load_ptr_acquire(mi_arena_pages_t, &heap->arena_pages[idx]) == NULL);
+  check(detached, "A7: the user heap's old tracking was detached");
+  if (detached) {
+    const size_t larger = 4 * BIG_BYTES;
+    p = mi_heap_malloc(heap, larger);
+    check(p != NULL, "A7: allocation in a larger arena succeeded");
+    if (p != NULL) {
+      arena = _mi_safe_ptr_page(p)->memid.mem.arena.arena;
+      check(arena->arena_idx == idx && arena->slice_count > old_slices,
+            "A7: the same slot now holds a larger arena");
+      memset(p, 0x72, larger);
+      check(big_verify(p, larger, 0x72), "A7: the replacement allocation remains writable");
+      mi_free(p);
+    }
+  }
+  mi_heap_delete(heap);
+  mi_free(keep);
+}
+
+int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);   // a hang must show which row it hangs in (ctest kills on TIMEOUT)
   printf("mimalloc-pprof: free-arena reclaim, MI_OWNER_GATE=%d MI_DEBUG=%d\n", (int)MI_OWNER_GATE, (int)MI_DEBUG);
-  run_reclaim_rows();
-  run_busy_thread_row();
-  run_parked_thread_row();
+  if (argc == 2 && strcmp(argv[1], "--heap-reuse") == 0) {
+    run_heap_reuse_row();
+  }
+  else {
+    run_reclaim_rows();
+    run_busy_thread_row();
+    run_parked_thread_row();
+  }
   mi_collect(true);
   printf("%s (%d failure(s))\n", (failures == 0 ? "PASSED" : "FAILED"), failures);
   return (failures == 0 ? 0 : 1);

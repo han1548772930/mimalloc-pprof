@@ -62,7 +62,10 @@ is **completely free**:
    bitmaps that belongs to the arena. The arena must also be the library's to give back: OS
    memory (not `MI_MEM_EXTERNAL`/static), not a sub-arena of caller-managed memory, not
    pinned, and not `exclusive` (a caller may still hold its `mi_arena_id_t`).
-2. **Hand back the per-heap tracking that points into it.** For the main heap that is
+2. **Hand back the per-heap tracking that points into it.** Non-main heaps' empty tracking
+   is detached and freed before any arena slot becomes reusable or `arena_count` shrinks.
+   A replacement arena may be larger and must receive a new bitmap. Emptiness is checked
+   again under `theap_meta_lock` before releasing the arena. For the main heap that is
    `&arena->pages_main`, whose on-demand `pages_abandoned[bin]` bitmaps are separate raw-OS
    chunks (#350) that the OS free below would otherwise leak; the slot in
    `heap_main->arena_pages[idx]` is cleared first (nothing else ever would: `mi_heap_free`
@@ -78,11 +81,6 @@ is **completely free**:
    (see the note below), and then
    `_mi_os_free_ex(subproc, arena, mi_size_of_slices(slice_count), false, memid)` returns the
    whole reservation, metadata included; `reserved` drops by that same size.
-6. **Sweep the leftovers.** A second pass frees any `heap->arena_pages[i]` from another heap
-   whose `subproc->arenas[i]` is NULL by now (detached under that heap's own
-   `arena_pages_lock`). Leaving one in place would be latent corruption: slot `i` can be
-   recycled for a *larger* arena, and the next `mi_bitmap_setN` into a bitmap sized for the
-   old `slice_count` writes past its end.
 
 The report says what happened:
 
@@ -157,7 +155,7 @@ Inside the pass: `subprocs_lock` (the caller's) -> `heaps_lock` -> `tlds_lock` -
 `theap_meta_lock`, plus the arena purge guard, which is a leaf (`mi_arenas_purge_guard`) —
 the documented order of `src/fork.c` (2 -> 4 -> 7) with the meta theap last, as
 `_mi_meta_zalloc` takes it. Nothing in the pass waits for a lock it holds, the per-heap
-leftover sweep releases `theap_meta_lock` before it frees (because `_mi_free_subproc_safe`
+tracking cleanup runs before taking `theap_meta_lock` (because `_mi_free_subproc_safe`
 may take it), and the OS free is the last thing done with an arena.
 
 ## 6. Accepted limits
@@ -227,6 +225,7 @@ in flight.
 | A4 | after the last live object is freed the remaining arenas of the peak go too: the metadata follows the live set, not the process peak |
 | A5 | (debug builds, `MI_DEBUG > 0`) a thread **inside** the allocator — stalled in `mi_heap_delete` between the pin and the claim — makes the pass refuse: `reclaimed == false`, nothing released, accounting untouched; once it is out, the same arena is released |
 | A6 | a live but **parked** thread (`mi_on_thread_idle_start`) does not block it: the claim protocol reaches it, and the parked thread's own allocation is never released under it |
+| A7 | `test-arena-reclaim-heap-reuse` releases a user heap's tail arena, checks that its tracking is cleared, and allocates into a larger arena reusing the same slot |
 
 All three builds the fork gates on are exercised locally:
 

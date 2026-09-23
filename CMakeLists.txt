@@ -2070,7 +2070,8 @@ if (MI_BUILD_TESTS)
       target_link_libraries(mimalloc-test-arena-reclaim PRIVATE Threads::Threads)
     endif()
     add_test(NAME test-arena-reclaim COMMAND mimalloc-test-arena-reclaim)
-    set_tests_properties(test-arena-reclaim PROPERTIES TIMEOUT 300)
+    add_test(NAME test-arena-reclaim-heap-reuse COMMAND mimalloc-test-arena-reclaim --heap-reuse)
+    set_tests_properties(test-arena-reclaim test-arena-reclaim-heap-reuse PROPERTIES TIMEOUT 300)
   endif()
 
   # macOS VM tag must be application-specific (issue #78).
@@ -2268,6 +2269,7 @@ set(mi_serial_tests
   # start at zero, and the reclaim releases every completely free arena of the process -- so no
   # other test may be reserving or releasing arenas while they run.
   test-arena-reclaim
+  test-arena-reclaim-heap-reuse
   # #371: a scaling RATIO is only meaningful with the machine to itself; an oversubscribed
   # wave would turn it into noise and, worse, into a flaky gate.
   test-observer-scaling
