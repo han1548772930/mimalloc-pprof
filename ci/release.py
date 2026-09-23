@@ -11,9 +11,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import posixpath
 import re
+import struct
 import subprocess
 import sys
+import tarfile
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -30,6 +34,12 @@ ASSET_TEMPLATES = (
     "mimalloc-pprof-windows-x64-gnu-{tag}.zip",
     "mimalloc-pprof-windows-x64-msvc-{tag}.zip",
 )
+TARGETS = {
+    "macos-arm64": "aarch64-apple-darwin",
+    "macos-x86_64": "x86_64-apple-darwin",
+    "windows-x64-gnu": "x86_64-pc-windows-gnu",
+    "windows-x64-msvc": "x86_64-pc-windows-msvc",
+}
 
 
 class ReleaseError(ValueError):
@@ -133,19 +143,65 @@ def issue_directives(issue: int) -> list[dict[str, Any]]:
     return [parsed for body in issue_comments(issue) if (parsed := parse_directive(body))]
 
 
+def recorded_merge_sha(body: str) -> str:
+    matches = re.findall(
+        r"(?im)^- Candidate merge SHA:\s*(?:`|\*\*)?([0-9a-f]{40})(?:`|\*\*)?\s*$", body
+    )
+    if len(matches) != 1:
+        raise ReleaseError("release issue must record one full Candidate merge SHA")
+    return matches[0]
+
+
+def recorded_version_bump_pr(body: str) -> int:
+    matches = re.findall(r"(?im)^- Version-bump PR:\s*#([1-9][0-9]*)\s*$", body)
+    if len(matches) != 1:
+        raise ReleaseError("release issue must record one Version-bump PR number")
+    return int(matches[0])
+
+
 def validate_candidate(value: dict[str, Any], *, require_registry_free: bool = True) -> None:
     expected = directive(value["issue"], value["version"], value["candidate_sha"])
     require_same_directive(expected, value)
     issue = json.loads(
-        command("gh", "issue", "view", str(value["issue"]), "-R", REPO, "--json", "title,state")
+        command(
+            "gh", "issue", "view", str(value["issue"]), "-R", REPO, "--json", "title,state,body"
+        )
     )
     if issue.get("state") != "OPEN" or f"v{value['version']}" not in issue.get("title", ""):
         raise ReleaseError("release issue is closed or targets a different version")
+    if recorded_merge_sha(issue.get("body", "")) != value["candidate_sha"]:
+        raise ReleaseError("candidate differs from the issue's reviewed version-bump merge SHA")
+    pr_number = recorded_version_bump_pr(issue["body"])
+    pr = json.loads(
+        command(
+            "gh",
+            "pr",
+            "view",
+            str(pr_number),
+            "-R",
+            REPO,
+            "--json",
+            "baseRefName,mergedAt,mergeCommit",
+        )
+    )
+    if (
+        pr.get("baseRefName") != "main"
+        or not pr.get("mergedAt")
+        or pr.get("mergeCommit", {}).get("oid") != value["candidate_sha"]
+    ):
+        raise ReleaseError("candidate is not the recorded PR's merged commit on main")
     if source_version() != value["version"]:
         raise ReleaseError("source Cargo version differs from the release directive")
     head = command("git", "rev-parse", "HEAD")
     if head != value["candidate_sha"]:
         raise ReleaseError("checkout HEAD differs from release candidate SHA")
+    parents = command("git", "rev-list", "--parents", "-n", "1", head).split()
+    if len(parents) not in (2, 3) or parents[0] != head:
+        raise ReleaseError("candidate is not a version-bump merge result")
+    previous = command("git", "show", f"{parents[1]}:rust/mimalloc-pprof/Cargo.toml")
+    previous_version = re.search(r'(?m)^version\s*=\s*"([^"]+)"', previous)
+    if not previous_version or previous_version.group(1) == value["version"]:
+        raise ReleaseError("candidate merge did not bump the version from its first parent")
     command("git", "fetch", "origin", "main")
     if subprocess.run(
         ("git", "merge-base", "--is-ancestor", head, "origin/main"),
@@ -179,6 +235,136 @@ def validate_candidate(value: dict[str, Any], *, require_registry_free: bool = T
             raise ReleaseError(f"crates.io version check failed: {error}") from error
 
 
+def archive_members(path: Path) -> dict[str, bytes]:
+    members: dict[str, bytes] = {}
+    try:
+        if path.name.endswith(".zip"):
+            with zipfile.ZipFile(path) as archive:
+                entries = []
+                total = 0
+                for row in archive.infolist():
+                    total += row.file_size
+                    if (
+                        row.file_size > MAX_ASSET_BYTES
+                        or total > MAX_ASSET_BYTES
+                        or (row.external_attr >> 16) & 0o170000 == 0o120000
+                    ):
+                        raise ReleaseError(f"invalid archive member {row.filename}")
+                    entries.append(
+                        (row.filename, row.is_dir(), archive.read(row) if not row.is_dir() else b"")
+                    )
+        else:
+            with tarfile.open(path, "r:gz") as archive:
+                entries = []
+                total = 0
+                for row in archive.getmembers():
+                    if row.isdir():
+                        entries.append((row.name, True, b""))
+                    elif row.issym():
+                        target = posixpath.normpath(
+                            posixpath.join(posixpath.dirname(row.name), row.linkname)
+                        )
+                        if (
+                            row.linkname.startswith("/")
+                            or target.startswith("../")
+                            or target == ".."
+                        ):
+                            raise ReleaseError(f"unsafe archive symlink {row.name}")
+                        entries.append((row.name, False, f"SYMLINK:{row.linkname}".encode()))
+                    elif row.isfile():
+                        stream = archive.extractfile(row)
+                        total += row.size
+                        if stream is None or row.size > MAX_ASSET_BYTES or total > MAX_ASSET_BYTES:
+                            raise ReleaseError(f"invalid archive member {row.name}")
+                        entries.append((row.name, False, stream.read()))
+                    else:
+                        raise ReleaseError(f"unsupported archive member {row.name}")
+    except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError) as error:
+        raise ReleaseError(f"malformed archive {path.name}: {error}") from error
+    for raw, is_directory, data in entries:
+        name = raw.removeprefix("./").rstrip("/")
+        if not name or is_directory:
+            continue
+        if name.startswith("/") or any(part in ("", ".", "..") for part in name.split("/")):
+            raise ReleaseError(f"unsafe archive member {raw}")
+        if name in members:
+            raise ReleaseError(f"duplicate archive member {name}")
+        members[name] = data
+    return members
+
+
+def inspect_archive(path: Path, value: dict[str, Any]) -> dict[str, Any]:
+    members = archive_members(path)
+    if path.name.startswith("mimalloc-pprof-c-"):
+        expected = {
+            name: (ROOT / "rust/mimalloc-pprof/vendor" / name).read_bytes()
+            for name in (
+                "mimalloc-pprof-amalgamated.c",
+                "mimalloc-pprof-amalgamated.h",
+                "mimalloc.h",
+                "mimalloc-stats.h",
+                "README.md",
+            )
+        }
+        if members != expected:
+            raise ReleaseError("C archive contents differ from candidate vendor sources")
+        return {
+            "target": "source",
+            "provenance_commit": value["candidate_sha"],
+            "members": sorted(members),
+        }
+    asset = next((key for key in TARGETS if f"-{key}-" in path.name), None)
+    if asset is None:
+        raise ReleaseError(f"unknown target archive {path.name}")
+    target = TARGETS[asset]
+    provenance = members.get("PROVENANCE.txt", b"").decode("utf-8", errors="replace")
+    if (
+        not re.search(rf"(?m)^commit:\s+{value['candidate_sha']}$", provenance)
+        or not re.search(rf"(?m)^target:\s+{re.escape(target)}$", provenance)
+        or not provenance.startswith(f"mimalloc-pprof {value['candidate_sha']} -- {asset}\n")
+    ):
+        raise ReleaseError(f"{path.name} has missing or mismatched provenance")
+    dylibs = [
+        name
+        for name, data in members.items()
+        if re.fullmatch(r"lib/libmimalloc\.3(?:\.[0-9]+)*\.dylib", name)
+        and not data.startswith(b"SYMLINK:")
+    ]
+    if asset.startswith("macos") and len(dylibs) != 1:
+        raise ReleaseError(f"{path.name} must contain one versioned mimalloc dylib")
+    binary_name = dylibs[0] if asset.startswith("macos") else "bin/mimalloc.dll"
+    binary = members.get(binary_name)
+    if binary is None:
+        raise ReleaseError(f"{path.name} lacks {binary_name}")
+    if asset.startswith("macos"):
+        cpu = 0x0100000C if asset == "macos-arm64" else 0x01000007
+        if (
+            len(binary) < 8
+            or binary[:4] != b"\xcf\xfa\xed\xfe"
+            or struct.unpack("<I", binary[4:8])[0] != cpu
+        ):
+            raise ReleaseError(f"{path.name} has wrong Mach-O target")
+    else:
+        if len(binary) < 0x40 or binary[:2] != b"MZ":
+            raise ReleaseError(f"{path.name} has invalid PE binary")
+        offset = struct.unpack("<I", binary[0x3C:0x40])[0]
+        if binary[offset : offset + 6] != b"PE\0\0\x64\x86":
+            raise ReleaseError(f"{path.name} has wrong PE target")
+        if "bin/mimalloc-redirect.dll" not in members:
+            raise ReleaseError(f"{path.name} lacks redirect DLL")
+        if asset == "windows-x64-gnu" and "bin/libgcc_s_seh-1.dll" not in members:
+            raise ReleaseError(f"{path.name} lacks GNU runtime DLL")
+        if asset == "windows-x64-msvc" and "bin/libgcc_s_seh-1.dll" in members:
+            raise ReleaseError(f"{path.name} contains GNU runtime in MSVC archive")
+    return {
+        "target": target,
+        "provenance_commit": value["candidate_sha"],
+        "binary": binary_name,
+        "binary_sha256": hashlib.sha256(binary).hexdigest(),
+        "members": sorted(members),
+    }
+
+
 def inspect_artifacts(directory: Path, value: dict[str, Any]) -> dict[str, Any]:
     actual = {
         path.name for path in directory.iterdir() if path.is_file() and path.name != "info.json"
@@ -188,7 +374,7 @@ def inspect_artifacts(directory: Path, value: dict[str, Any]) -> dict[str, Any]:
         raise ReleaseError(
             f"asset set mismatch: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
         )
-    artifacts: list[dict[str, str | int]] = []
+    artifacts: list[dict[str, Any]] = []
     for name in value["assets"]:
         path = directory / name
         if path.is_symlink():
@@ -197,7 +383,12 @@ def inspect_artifacts(directory: Path, value: dict[str, Any]) -> dict[str, Any]:
         if size == 0 or size > MAX_ASSET_BYTES:
             raise ReleaseError(f"asset {name} has unacceptable size {size}")
         artifacts.append(
-            {"name": name, "bytes": size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            {
+                "name": name,
+                "bytes": size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "validated": inspect_archive(path, value),
+            }
         )
     digest = hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()

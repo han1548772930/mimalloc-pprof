@@ -6,6 +6,13 @@ every required cell in `ci/release_full_ci_manifest.v1.json`, all at the exact
 merged candidate SHA. Native hosted macOS Intel and Apple Silicon are allowed
 for this opt-in full/release validation.
 
+Before starting a candidate, update the control issue body with exactly one
+`- Version-bump PR: #<number>` line and one
+`- Candidate merge SHA: **<full lowercase SHA>**` line. The front door verifies
+that GitHub records the PR as merged to `main` at that SHA and that the resulting
+commit changes the package version from its first parent. Squash and ordinary
+merge results are both accepted; an absent or conflicting record fails closed.
+
 `ci/release.py` is the attempt front door. Issue #444 is the live control record
 for the v1.0.1 pilot. After a reviewed version bump is merged to `main`, use a
 clean checkout of that main commit:
@@ -45,3 +52,22 @@ Two additional gates must be closed before the real publisher is enabled:
   The release preflight must inspect each archive's internal target identity and
   provenance, then prove that the shipped bytes are the same bytes exercised by
   the exact-SHA full test bundles. A matching filename alone is insufficient.
+
+The archive inspection gate now checks the C ZIP against candidate vendor files,
+checks binary archive `PROVENANCE.txt` commit/target fields, and checks the
+installed Mach-O or PE library header. It records the validated target, commit,
+member list, and binary hash in `info.json`. This does **not** establish that the
+full test jobs executed the same library bytes: `auto-release.yml` builds its
+installable assets in separate jobs from `macos-bundles.yml` and
+`windows-bundles.yml`, whose test bundles are built again.
+
+Before publication, make each release archive derive from the exact Linux-built
+Release bundle artifact that the native target runner downloaded and executed,
+or include the installable library in that test bundle and make the release
+worker compare its SHA-256 with the archive member. Pin both downloads to the
+recorded successful full run IDs and candidate SHA; do not select artifacts by
+name across runs. The worker should fail if a run is missing, unsuccessful, or
+its extracted library hash differs, and record the run ID and matching library
+hash per target in `info.json`. The C source ZIP needs a separate candidate-tree
+comparison as implemented above. This flow needs an end-to-end dry run before
+the publisher gate can be opened.

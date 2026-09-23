@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import struct
+import tarfile
 import tempfile
 import unittest
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -49,10 +53,48 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             for name in directive["assets"]:
-                (directory / name).write_bytes(name.encode())
+                path = directory / name
+                if name.startswith("mimalloc-pprof-c-"):
+                    with zipfile.ZipFile(path, "w") as archive:
+                        for member in (
+                            "mimalloc-pprof-amalgamated.c",
+                            "mimalloc-pprof-amalgamated.h",
+                            "mimalloc.h",
+                            "mimalloc-stats.h",
+                            "README.md",
+                        ):
+                            archive.write(
+                                release.ROOT / "rust/mimalloc-pprof/vendor" / member, member
+                            )
+                    continue
+                asset = next(key for key in release.TARGETS if f"-{key}-" in name)
+                provenance = f"mimalloc-pprof {SHA} -- {asset}\n\ncommit:   {SHA}\ntarget:   {release.TARGETS[asset]}\n".encode()
+                if asset.startswith("macos"):
+                    cpu = 0x0100000C if asset == "macos-arm64" else 0x01000007
+                    members = {
+                        "PROVENANCE.txt": provenance,
+                        "lib/libmimalloc.3.1.dylib": b"\xcf\xfa\xed\xfe" + struct.pack("<I", cpu),
+                    }
+                    with tarfile.open(path, "w:gz") as archive:
+                        for member, data in members.items():
+                            entry = tarfile.TarInfo(member)
+                            entry.size = len(data)
+                            archive.addfile(entry, BytesIO(data))
+                else:
+                    pe = bytearray(0x86)
+                    pe[:2] = b"MZ"
+                    pe[0x3C:0x40] = struct.pack("<I", 0x80)
+                    pe[0x80:0x86] = b"PE\0\0\x64\x86"
+                    with zipfile.ZipFile(path, "w") as archive:
+                        archive.writestr("PROVENANCE.txt", provenance)
+                        archive.writestr("bin/mimalloc.dll", pe)
+                        archive.writestr("bin/mimalloc-redirect.dll", pe)
+                        if asset == "windows-x64-gnu":
+                            archive.writestr("bin/libgcc_s_seh-1.dll", pe)
             info = release.inspect_artifacts(directory, directive)
             self.assertEqual(info["candidate_sha"], SHA)
             self.assertEqual(len(info["artifacts"]), 5)
+            self.assertEqual(info["artifacts"][1]["validated"]["target"], "aarch64-apple-darwin")
             release.verify_info(directory, directive, info)
             info["artifacts"][0]["sha256"] = "0" * 64
             with self.assertRaises(release.ReleaseError):
@@ -65,6 +107,96 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             (directory / directive["assets"][0]).unlink()
             with self.assertRaises(release.ReleaseError):
                 release.inspect_artifacts(directory, directive)
+
+    def test_archives_reject_wrong_target_and_provenance(self) -> None:
+        value = release.directive(444, "1.0.1", SHA)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / value["assets"][1]
+            with tarfile.open(path, "w:gz") as archive:
+                for name, data in {
+                    "PROVENANCE.txt": f"mimalloc-pprof {'b' * 40} -- macos-arm64\ncommit:   {'b' * 40}\ntarget:   aarch64-apple-darwin\n".encode(),
+                    "lib/libmimalloc.3.1.dylib": b"\xcf\xfa\xed\xfe"
+                    + struct.pack("<I", 0x0100000C),
+                }.items():
+                    entry = tarfile.TarInfo(name)
+                    entry.size = len(data)
+                    archive.addfile(entry, BytesIO(data))
+            with self.assertRaisesRegex(release.ReleaseError, "provenance"):
+                release.inspect_archive(path, value)
+            with tarfile.open(path, "w:gz") as archive:
+                members = {
+                    "PROVENANCE.txt": f"mimalloc-pprof {SHA} -- macos-arm64\ncommit:   {SHA}\ntarget:   aarch64-apple-darwin\n".encode(),
+                    "lib/libmimalloc.3.1.dylib": b"\xcf\xfa\xed\xfe"
+                    + struct.pack("<I", 0x01000007),
+                }
+                for name, data in members.items():
+                    entry = tarfile.TarInfo(name)
+                    entry.size = len(data)
+                    archive.addfile(entry, BytesIO(data))
+            with self.assertRaisesRegex(release.ReleaseError, "Mach-O target"):
+                release.inspect_archive(path, value)
+
+    def test_candidate_requires_recorded_version_bump_merge(self) -> None:
+        self.assertEqual(release.recorded_merge_sha(f"- Candidate merge SHA: **{SHA}**"), SHA)
+        self.assertEqual(release.recorded_version_bump_pr("- Version-bump PR: #999"), 999)
+        for body in (
+            "- Candidate merge SHA: **pending**",
+            "",
+            f"- Candidate merge SHA: **{SHA}**\n- Candidate merge SHA: **{SHA}**",
+        ):
+            with self.assertRaises(release.ReleaseError):
+                release.recorded_merge_sha(body)
+        with self.assertRaises(release.ReleaseError):
+            release.recorded_version_bump_pr("- Version-bump PR: pending")
+
+    def test_candidate_accepts_recorded_squash_merge_and_rejects_other_pr(self) -> None:
+        value = release.directive(444, "1.0.1", SHA)
+        parent = "b" * 40
+        responses = {
+            "issue": json.dumps(
+                {
+                    "state": "OPEN",
+                    "title": "release v1.0.1",
+                    "body": f"- Candidate merge SHA: **{SHA}**\n- Version-bump PR: #999",
+                }
+            ),
+            "pr": json.dumps(
+                {
+                    "baseRefName": "main",
+                    "mergedAt": "2026-09-23T00:00:00Z",
+                    "mergeCommit": {"oid": SHA},
+                }
+            ),
+            "HEAD": SHA,
+            "parents": f"{SHA} {parent}",
+            "previous": '[package]\nversion = "1.0.0"\n',
+        }
+
+        def fake_command(*args: str) -> str:
+            if args[:3] == ("gh", "issue", "view"):
+                return responses["issue"]
+            if args[:3] == ("gh", "pr", "view"):
+                return responses["pr"]
+            if args[:3] == ("git", "rev-parse", "HEAD"):
+                return responses["HEAD"]
+            if args[:3] == ("git", "rev-list", "--parents"):
+                return responses["parents"]
+            if args[:2] == ("git", "show"):
+                return responses["previous"]
+            return ""
+
+        with (
+            patch.object(release, "command", side_effect=fake_command),
+            patch.object(release, "source_version", return_value="1.0.1"),
+            patch.object(release.subprocess, "run") as run,
+        ):
+            run.return_value.returncode = 0
+            release.validate_candidate(value, require_registry_free=False)
+            responses["pr"] = json.dumps(
+                {"baseRefName": "main", "mergedAt": "now", "mergeCommit": {"oid": parent}}
+            )
+            with self.assertRaisesRegex(release.ReleaseError, "recorded PR"):
+                release.validate_candidate(value, require_registry_free=False)
 
     def test_comment_round_trip_and_dry_run_has_no_worker_dispatch(self) -> None:
         directive = release.directive(444, "1.0.1", SHA)
