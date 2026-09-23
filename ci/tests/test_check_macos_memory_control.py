@@ -15,7 +15,7 @@ class NativeMacControlTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
 
     def runs(self, prefix: str, peak: float, leak: int) -> list[Path]:
-        paths = []
+        paths: list[Path] = []
         for index in range(8):
             path = self.root / f"{prefix}-{index}.json"
             path.write_text(

@@ -123,11 +123,16 @@ def allowed_full_runner(file: Path, document: object, path: str, label: str) -> 
         return False
     if not isinstance(document, dict):
         return False
-    jobs = document.get("jobs")
-    job = jobs.get("run-macos-native-full") if isinstance(jobs, dict) else None
-    if not isinstance(job, dict) or job.get("runs-on") != "${{ matrix.runner }}":
+    jobs = cast("dict[str, object]", document).get("jobs")
+    if not isinstance(jobs, dict):
         return False
-    gate = job.get("if")
+    job = cast("dict[str, object]", jobs).get("run-macos-native-full")
+    if not isinstance(job, dict):
+        return False
+    fields = cast("dict[str, object]", job)
+    if fields.get("runs-on") != "${{ matrix.runner }}":
+        return False
+    gate = fields.get("if")
     if not isinstance(gate, str):
         return False
     expected = (
@@ -135,8 +140,14 @@ def allowed_full_runner(file: Path, document: object, path: str, label: str) -> 
         "contains(github.event.pull_request.labels.*.name, 'ci-full')) || "
         "(github.event_name == 'workflow_dispatch' && inputs.ci-mode == 'full')"
     )
-    matrix = job.get("strategy", {}).get("matrix", {}).get("include")
-    return " ".join(gate.split()) == expected and matrix == [
+    strategy = fields.get("strategy")
+    if not isinstance(strategy, dict):
+        return False
+    matrix = cast("dict[str, object]", strategy).get("matrix")
+    if not isinstance(matrix, dict):
+        return False
+    include = cast("dict[str, object]", matrix).get("include")
+    return " ".join(gate.split()) == expected and include == [
         {"arch": "arm64", "runner": "macos-15", "triple": "aarch64-apple-darwin"},
         {"arch": "x64", "runner": "macos-15-intel", "triple": "x86_64-apple-darwin"},
     ]

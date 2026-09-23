@@ -166,7 +166,9 @@ class AutoReleaseStructureTests(unittest.TestCase):
 
     def test_dry_run_has_no_external_write_steps(self) -> None:
         workflow = self.doc
-        triggers = workflow.get("on", workflow.get(True))  # PyYAML 1.1 treats `on` as boolean.
+        # PyYAML 1.1 treats `on` as boolean, so inspect both possible key types.
+        trigger_keys = cast(dict[object, Any], workflow)
+        triggers = cast(dict[str, Any], trigger_keys.get("on", trigger_keys.get(True)))
         self.assertTrue(triggers["workflow_dispatch"]["inputs"]["dry_run"]["default"])
         release = self.jobs()["release"]
         steps = release["steps"]
@@ -200,7 +202,8 @@ class AutoReleaseStructureTests(unittest.TestCase):
         )
 
     def test_tag_push_cannot_publish_and_real_run_needs_full_sha_evidence(self) -> None:
-        triggers = self.doc.get("on", self.doc.get(True))
+        trigger_keys = cast(dict[object, Any], self.doc)
+        triggers = cast(dict[str, Any], trigger_keys.get("on", trigger_keys.get(True)))
         self.assertNotIn("push", triggers)
         inputs = triggers["workflow_dispatch"]["inputs"]
         self.assertIn("candidate_sha", inputs)
