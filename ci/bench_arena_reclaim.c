@@ -29,6 +29,9 @@ extern "C" {
 #define BIG_BYTES ((size_t)32 * 1024 * 1024)
 #define BIG_COUNT 8
 
+static int g_retained_id_checked = 0;
+static int g_retained_id_valid = 0;
+
 static double seconds_now(void) {
 #ifdef _WIN32
   LARGE_INTEGER frequency, counter;
@@ -93,7 +96,8 @@ static void sample(const char* phase, int wave, double elapsed_ms,
          "\"arena_metadata_bytes\":%llu,\"elapsed_ms\":%.6f,"
          "\"reclaim_requested\":%s,\"purge_status\":%d,\"reclaim_pass_ran\":%s,"
          "\"arenas_reclaimed\":%llu,\"arena_reclaim_bytes\":%llu,"
-         "\"arenas_kept\":%llu,\"subprocs_pending\":%llu}\n",
+         "\"arenas_kept\":%llu,\"subprocs_pending\":%llu,"
+         "\"retained_id_checked\":%s,\"retained_id_valid\":%s}\n",
          phase, wave, (unsigned long long)pm.rss,
          (unsigned long long)pm.private_bytes, (unsigned long long)pm.virtual_bytes,
          (unsigned long long)holes.arena_reserved_bytes, (long long)stats.committed.current,
@@ -102,7 +106,8 @@ static void sample(const char* phase, int wave, double elapsed_ms,
          (unsigned long long)(report ? report->arenas_reclaimed : 0),
          (unsigned long long)(report ? report->arena_reclaim_bytes : 0),
          (unsigned long long)(report ? report->arenas_kept : 0),
-         (unsigned long long)(report ? report->subprocs_pending : 0));
+         (unsigned long long)(report ? report->subprocs_pending : 0),
+         g_retained_id_checked ? "true" : "false", g_retained_id_valid ? "true" : "false");
   fflush(stdout);
 }
 
@@ -115,8 +120,8 @@ static void* alloc_touched(void) {
 
 int main(int argc, char** argv) {
   if (argc != 3 || (strcmp(argv[1], "purge-only") != 0 && strcmp(argv[1], "reclaim") != 0) ||
-      (strcmp(argv[2], "empty") != 0 && strcmp(argv[2], "nonempty") != 0)) {
-    fprintf(stderr, "usage: bench_arena_reclaim {purge-only|reclaim} {empty|nonempty}\n");
+      (strcmp(argv[2], "empty") != 0 && strcmp(argv[2], "nonempty") != 0 && strcmp(argv[2], "retained-id") != 0)) {
+    fprintf(stderr, "usage: bench_arena_reclaim {purge-only|reclaim} {empty|nonempty|retained-id}\n");
     return 2;
   }
   const int reclaim = strcmp(argv[1], "reclaim") == 0;
@@ -125,6 +130,16 @@ int main(int argc, char** argv) {
   mi_scavenger_stop();
   void* small = mi_malloc(64); /* keep ordinary process activity separate from big arenas */
   if (small == NULL) return 5;
+  mi_arena_id_t retained_id = NULL;
+  void* retained_area = NULL;
+  size_t retained_size = 0;
+  if (strcmp(argv[2], "retained-id") == 0) {
+    if (mi_reserve_os_memory_ex(64 * 1024 * 1024, false, false, false, &retained_id) != 0 || retained_id == NULL) return 6;
+    retained_area = mi_arena_area(retained_id, &retained_size);
+    if (retained_area == NULL || retained_size < 64 * 1024 * 1024) return 6;
+    g_retained_id_checked = 1;
+    g_retained_id_valid = 1;
+  }
   void* blocks[BIG_COUNT];
   sample("baseline", 0, 0.0, 0, 0, NULL);
   for (int wave = 1; wave <= 2; wave++) {
@@ -143,7 +158,14 @@ int main(int argc, char** argv) {
       mi_purge_all_report_t report;
       start = seconds_now();
       status = mi_purge_all_ex((mi_purge_flags_t)(MI_PURGE_FORCE | MI_PURGE_RECLAIM), 100, &report);
-      sample("reclaim", wave, (seconds_now() - start) * 1000.0, 1, status, &report);
+      const double reclaim_ms = (seconds_now() - start) * 1000.0;
+      if (retained_id != NULL) {
+        size_t size_after = 0;
+        void* area_after = mi_arena_area(retained_id, &size_after);
+        g_retained_id_valid = (area_after == retained_area && size_after == retained_size);
+        if (!g_retained_id_valid) return 7;
+      }
+      sample("reclaim", wave, reclaim_ms, 1, status, &report);
     } else {
       sample("reclaim", wave, 0.0, 0, 0, NULL); /* aligned control checkpoint */
     }

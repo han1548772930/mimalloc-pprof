@@ -23,7 +23,7 @@ from xml.sax.saxutils import escape
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA = ROOT / ".github/assets/arena-reclaim-results.json"
 MODES = ("purge-only", "reclaim")
-SCENARIOS = ("empty", "nonempty")
+SCENARIOS = ("empty", "nonempty", "retained-id")
 PHASES = ("baseline", "peak", "free", "purge", "reclaim", "peak", "free", "purge", "reclaim")
 METRICS = (
     "rss_bytes",
@@ -54,7 +54,18 @@ def build(root: Path, owner_gate: bool, toolchain: str) -> tuple[Path, list[str]
         "-DMI_PPROF=OFF",
         f"-DMI_OWNER_GATE={'ON' if owner_gate else 'OFF'}",
     ]
-    run(["cmake", "-S", str(ROOT), "-B", str(directory), *flags])
+    generator = [] if toolchain == "msvc" else ["-G", "Ninja"]
+    run(
+        [
+            "cmake",
+            "-S",
+            str(ROOT / "ci/arena_reclaim_bench"),
+            "-B",
+            str(directory),
+            *generator,
+            *flags,
+        ]
+    )
     run(
         [
             "cmake",
@@ -63,60 +74,16 @@ def build(root: Path, owner_gate: bool, toolchain: str) -> tuple[Path, list[str]
             "--config",
             "Release",
             "--target",
-            "mimalloc-static",
+            "bench-arena-reclaim",
             "-j",
             "4",
         ]
     )
-    libraries = list(directory.rglob("mimalloc.lib" if toolchain == "msvc" else "libmimalloc.a"))
-    if len(libraries) != 1:
-        raise ValueError(f"expected one static mimalloc library in {directory}: {libraries}")
-    exe = directory / ("bench_arena_reclaim.exe" if os.name == "nt" else "bench_arena_reclaim")
-    source = ROOT / "ci/bench_arena_reclaim.c"
-    include = ROOT / "include"
-    if toolchain == "msvc":
-        # The internal report header is also used by the C++ white-box test;
-        # cl's C front end has no C11 atomics, so compile this child as C++.
-        compile_cmd = [
-            "cl",
-            "/nologo",
-            "/O2",
-            "/TP",
-            f"/I{include}",
-            str(source),
-            str(libraries[0]),
-            "psapi.lib",
-            f"/Fe:{exe}",
-        ]
-    elif toolchain == "mingw":
-        compile_cmd = [
-            "gcc",
-            "-O2",
-            "-std=c11",
-            f"-I{include}",
-            str(source),
-            str(libraries[0]),
-            "-lpsapi",
-            "-o",
-            str(exe),
-        ]
-    else:
-        compile_cmd = [
-            "cc",
-            "-O2",
-            "-std=c11",
-            "-D_POSIX_C_SOURCE=200809L",
-            f"-I{include}",
-            str(source),
-            str(libraries[0]),
-            "-pthread",
-            "-lrt",
-            "-latomic",
-            "-o",
-            str(exe),
-        ]
-    run(compile_cmd)
-    return exe, flags
+    names = ("bench-arena-reclaim.exe", "bench-arena-reclaim")
+    executables = [p for name in names for p in directory.rglob(name) if p.is_file()]
+    if len(executables) != 1:
+        raise ValueError(f"expected one benchmark executable in {directory}: {executables}")
+    return executables[0], flags
 
 
 def validate_samples(samples: list[dict[str, Any]], mode: str, scenario: str) -> None:
@@ -150,6 +117,13 @@ def validate_samples(samples: list[dict[str, Any]], mode: str, scenario: str) ->
             raise ValueError("reclaimed bytes without a completed pass")
         if scenario == "nonempty" and row["arenas_reclaimed"] > 0:
             raise ValueError("nonempty control released a live arena")
+        if scenario == "retained-id" and mode == "reclaim" and row["arenas_kept"] < 1:
+            raise ValueError("caller-reserved arena was not reported kept")
+    if scenario == "retained-id" and any(
+        s.get("retained_id_checked") is not True or s.get("retained_id_valid") is not True
+        for s in samples
+    ):
+        raise ValueError("retained arena ID did not survive the pass")
 
 
 def measure(
@@ -157,7 +131,7 @@ def measure(
 ) -> dict[str, Any]:
     if runs < 3:
         raise ValueError("at least three paired repetitions are required")
-    sha = run(["git", "rev-parse", "HEAD"]).strip()
+    sha = os.environ.get("GITHUB_SHA") or run(["git", "rev-parse", "HEAD"]).strip()
     report: dict[str, Any] = {
         "schema": "arena-reclaim-v1",
         "source_sha": sha,
@@ -239,6 +213,8 @@ def validate_report(data: dict[str, Any]) -> None:
         grouped.setdefault(key, set()).add(mode)
     if any(modes != set(MODES) for modes in grouped.values()):
         raise ValueError("unpaired run")
+    if {record["scenario"] for record in data["records"]} != set(SCENARIOS):
+        raise ValueError("missing required empty/nonempty/retained-ID scenario")
 
 
 def svg(data: dict[str, Any], kind: str) -> str:

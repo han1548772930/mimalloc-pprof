@@ -6,8 +6,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
+from typing import Any
 
 from bench_arena_reclaim import METRICS, PHASES, svg, validate_report
 
@@ -15,12 +14,12 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "ci/bench_arena_reclaim.py"
 
 
-def fixture_data() -> dict:
-    records = []
-    for scenario in ("empty", "nonempty"):
+def fixture_data() -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    for scenario in ("empty", "nonempty", "retained-id"):
         for repeat in range(3):
             for mode in ("purge-only", "reclaim"):
-                samples = []
+                samples: list[dict[str, Any]] = []
                 for i, phase in enumerate(PHASES):
                     reclaimed = mode == "reclaim" and scenario == "empty" and phase == "reclaim"
                     sample = {
@@ -34,7 +33,11 @@ def fixture_data() -> dict:
                         "arena_reclaim_bytes": 100 * 1048576 if reclaimed else 0,
                         "arenas_kept": 0,
                         "subprocs_pending": 0,
+                        "retained_id_checked": scenario == "retained-id",
+                        "retained_id_valid": scenario == "retained-id",
                     }
+                    if scenario == "retained-id" and mode == "reclaim" and phase == "reclaim":
+                        sample["arenas_kept"] = 1
                     sample.update(dict.fromkeys(METRICS, 0))
                     sample["rss_bytes"] = (10 if reclaimed else 20) * 1048576
                     sample["private_bytes"] = (8 if reclaimed else 18) * 1048576
@@ -61,8 +64,11 @@ def fixture_data() -> dict:
 def test_rejects_missing_reclaim_marker() -> None:
     data = fixture_data()
     del data["records"][1]["samples"][4]["reclaim_pass_ran"]
-    with pytest.raises((ValueError, KeyError)):
+    try:
         validate_report(data)
+    except (ValueError, KeyError):
+        return
+    raise AssertionError("missing reclaim marker was accepted")
 
 
 def test_figure_does_not_label_reservation_as_rss() -> None:
