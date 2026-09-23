@@ -136,6 +136,35 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError, "Mach-O target"):
                 release.inspect_archive(path, value)
 
+    def test_archive_member_paths_and_symlink_targets_are_confined(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            zip_path = root / "bad.zip"
+            for member in ("C:/escape", "dir\\escape", "../escape"):
+                with zipfile.ZipFile(zip_path, "w") as archive:
+                    archive.writestr(member, b"x")
+                with self.assertRaisesRegex(release.ReleaseError, "unsafe archive member"):
+                    release.archive_members(zip_path)
+            tar_path = root / "bad.tar.gz"
+            for target in ("../../escape", "C:/escape", "\\escape", "missing"):
+                with tarfile.open(tar_path, "w:gz") as archive:
+                    entry = tarfile.TarInfo("lib/link.dylib")
+                    entry.type = tarfile.SYMTYPE
+                    entry.linkname = target
+                    archive.addfile(entry)
+                with self.assertRaises(release.ReleaseError):
+                    release.archive_members(tar_path)
+            with tarfile.open(tar_path, "w:gz") as archive:
+                data = b"mach-o"
+                real = tarfile.TarInfo("lib/real.dylib")
+                real.size = len(data)
+                archive.addfile(real, BytesIO(data))
+                link = tarfile.TarInfo("lib/link.dylib")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "real.dylib"
+                archive.addfile(link)
+            self.assertIn("lib/link.dylib", release.archive_members(tar_path))
+
     def test_candidate_requires_recorded_version_bump_merge(self) -> None:
         self.assertEqual(release.recorded_merge_sha(f"- Candidate merge SHA: **{SHA}**"), SHA)
         self.assertEqual(release.recorded_version_bump_pr("- Version-bump PR: #999"), 999)

@@ -237,10 +237,11 @@ def validate_candidate(value: dict[str, Any], *, require_registry_free: bool = T
 
 def archive_members(path: Path) -> dict[str, bytes]:
     members: dict[str, bytes] = {}
+    entries: list[tuple[str, bool, bytes]] = []
+    links: dict[str, str] = {}
     try:
         if path.name.endswith(".zip"):
             with zipfile.ZipFile(path) as archive:
-                entries = []
                 total = 0
                 for row in archive.infolist():
                     total += row.file_size
@@ -255,22 +256,19 @@ def archive_members(path: Path) -> dict[str, bytes]:
                     )
         else:
             with tarfile.open(path, "r:gz") as archive:
-                entries = []
                 total = 0
                 for row in archive.getmembers():
                     if row.isdir():
                         entries.append((row.name, True, b""))
                     elif row.issym():
-                        target = posixpath.normpath(
-                            posixpath.join(posixpath.dirname(row.name), row.linkname)
-                        )
                         if (
                             row.linkname.startswith("/")
-                            or target.startswith("../")
-                            or target == ".."
+                            or "\\" in row.linkname
+                            or re.match(r"^[A-Za-z]:", row.linkname)
                         ):
                             raise ReleaseError(f"unsafe archive symlink {row.name}")
                         entries.append((row.name, False, f"SYMLINK:{row.linkname}".encode()))
+                        links[row.name.removeprefix("./")] = row.linkname
                     elif row.isfile():
                         stream = archive.extractfile(row)
                         total += row.size
@@ -283,13 +281,30 @@ def archive_members(path: Path) -> dict[str, bytes]:
         raise ReleaseError(f"malformed archive {path.name}: {error}") from error
     for raw, is_directory, data in entries:
         name = raw.removeprefix("./").rstrip("/")
-        if not name or is_directory:
+        if not name and raw in (".", "./") and is_directory:
             continue
-        if name.startswith("/") or any(part in ("", ".", "..") for part in name.split("/")):
+        if (
+            name.startswith("/")
+            or "\\" in name
+            or re.match(r"^[A-Za-z]:", name)
+            or any(part in ("", ".", "..") for part in name.split("/"))
+        ):
             raise ReleaseError(f"unsafe archive member {raw}")
+        if is_directory:
+            continue
         if name in members:
             raise ReleaseError(f"duplicate archive member {name}")
         members[name] = data
+    for name in links:
+        seen: set[str] = set()
+        current = name
+        while current in links:
+            if current in seen:
+                raise ReleaseError(f"cyclic archive symlink {name}")
+            seen.add(current)
+            current = posixpath.normpath(posixpath.join(posixpath.dirname(current), links[current]))
+            if current.startswith("../") or current == ".." or current not in members:
+                raise ReleaseError(f"unresolved archive symlink {name}")
     return members
 
 
