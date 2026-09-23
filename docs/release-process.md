@@ -53,6 +53,18 @@ first tag, registry, or release write, preserve each archive's validated hashes
 across retries, and verify final registry destinations. The real publisher is
 still disabled by its explicit failing gate.
 
+`python3 -m ci.release_destinations --issue 444 --candidate-sha <SHA> --dist
+<five-archive-directory> --crate <packaged-crate-path>` runs read-only destination
+preflight. It re-inspects the five archives against `info.json`, hashes the
+packaged `.crate`, compares any existing issue freeze, tag, draft assets and
+crates.io checksum, then prints the missing outputs and proposed freeze record.
+The `.crate` must be outside the five-archive directory. This command makes no
+issue comment, tag, release, upload, or registry write. The tested state-machine
+interface in `ci/release_destinations.py` freezes before its first write,
+rechecks destinations after upload, and retries only explicitly transient
+GitHub failures (ten attempts, exponential delays capped at 30 seconds).
+There is deliberately no live write adapter or workflow call to it yet.
+
 The archive inspection gate now checks the C ZIP against candidate vendor files,
 checks binary archive `PROVENANCE.txt` commit/target fields, and checks the
 installed Mach-O or PE library header. It records the validated target, commit,
