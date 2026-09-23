@@ -1907,7 +1907,7 @@ static mi_bitmap_t* mi_arena_pages_abandoned_ensure(mi_arena_t* arena, mi_arena_
 // per-bin bitmaps alive -- but only because this free is in `mi_heap_free` and not earlier: a
 // future refactor must not move it up.
 // Bun parity P10b, #317, ported from oven-sh/mimalloc @ 787be2a8, MIT.
-static void mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages) {
+void _mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages) {
   for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
     if (mi_atomic_load_ptr_relaxed(mi_bitmap_t, &arena_pages->pages_abandoned[bin]) == NULL) continue;  // the common case
     mi_bitmap_t* bitmap = mi_atomic_exchange_ptr_acq_rel(mi_bitmap_t, &arena_pages->pages_abandoned[bin], NULL);
@@ -1920,7 +1920,7 @@ static void mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages) {
 // where `heap` is in scope; this function itself has no handle to the owning heap.
 void _mi_arena_pages_free(mi_arena_pages_t* arena_pages) {
   if (arena_pages == NULL) return;
-  mi_arena_pages_free_abandoned(arena_pages);
+  _mi_arena_pages_free_abandoned(arena_pages);
   _mi_free_subproc_safe(arena_pages);
 }
 
@@ -2688,6 +2688,18 @@ void _mi_arenas_fork_child(void) {
   _mi_arenas_purge_guard_reset();
 }
 
+// The empty-arena reclaim (src/arena-reclaim.c) holds the purge guard for its whole pass,
+// so the background scavenger's timer skips its arena purge while an arena is being released
+// (`mi_atomic_guard` is non-blocking). NOT a `mi_atomic_guard` block: the critical section
+// spans a whole function call, and the reclaim may not be entered recursively.
+bool _mi_arenas_purge_guard_acquire(void) {
+  return (mi_atomic_exchange_acq_rel(&mi_arenas_purge_guard, (uintptr_t)1) == 0);
+}
+
+void _mi_arenas_purge_guard_release(void) {
+  mi_atomic_store_release(&mi_arenas_purge_guard, (uintptr_t)0);
+}
+
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).
 // Bring every arena's scheduled purge forward to "now" and get it done: either by waking the
 // scavenger (which then runs `_mi_arenas_try_purge`), or inline when no scavenger is running.
@@ -2730,8 +2742,7 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   const mi_msecs_t arenas_expire = mi_atomic_loadi64_acquire(&subproc->purge_expire);
   if (!visit_all && !force && (arenas_expire == 0 || arenas_expire > now)) return;
 
-  const size_t max_arena = mi_arenas_get_count(subproc);
-  if (max_arena == 0) return;
+  if (mi_arenas_get_count(subproc) == 0) return;
 
   // allow only one thread to purge at a time (todo: allow concurrent purging?)
   //
@@ -2778,9 +2789,11 @@ void _mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, siz
   mi_atomic_guard(&mi_arenas_purge_guard)
   {
     ran = true;
+    // Reclaim can shrink the table while we wait for the guard.
+    const size_t max_arena = mi_arenas_get_count(subproc);
     // increase global expire: at most one purge per delay cycle
     if (arenas_expire > now) { mi_atomic_storei64_release(&subproc->purge_expire, now + (delay/10)); }
-    const size_t arena_start = tseq % max_arena;
+    const size_t arena_start = (max_arena == 0 ? 0 : tseq % max_arena);
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
     bool any_purged = false;
