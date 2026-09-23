@@ -211,6 +211,15 @@ mi_decl_export void mi_on_thread_idle_end(void) mi_attr_noexcept;
 // registered thread's pages and holes -- and reports exactly what it could not reach.
 typedef enum mi_purge_flags_e {
   MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed sweep runs to completion (ignores park_reclaim)
+  // After the walk (phase F, docs/arena-reclaim.md): give back every arena of every sub-process
+  // that is COMPLETELY free --
+  // its metadata included (phase F, docs/arena-reclaim.md). That needs every thread of the
+  // sub-process OUT of the allocator at the same instant: a parked thread is claimable (a
+  // MI_OWNER_GATE build parks every thread outside the allocator; otherwise
+  // `mi_on_thread_idle_start` is the park), a thread inside a call is not, and its sub-process
+  // is then reported in `subprocs_pending` with nothing released. `wait_ms` also bounds this
+  // phase's own retry for that, in the sense above.
+  MI_PURGE_RECLAIM = 2,
 } mi_purge_flags_t;
 
 typedef struct mi_purge_all_report_s {
@@ -221,6 +230,11 @@ typedef struct mi_purge_all_report_s {
   size_t theaps_orphaned;    // pre-fork tlds of vanished threads, never touched
   bool   gated;              // built with MI_OWNER_GATE (configuration, not completion)
   bool   complete;           // theaps_pending == 0 && theaps_orphaned == 0
+  size_t arenas_reclaimed;   // phase F: arenas released to the OS (their metadata included)
+  size_t arena_reclaim_bytes;// phase F: the reservation bytes those arenas held
+  size_t arenas_kept;        // phase F: arenas seen completely free and not released -- not ours to give back (see docs/arena-reclaim.md)
+  size_t subprocs_pending;   // phase F: sub-processes whose threads could not all be claimed (nothing released there)
+  bool   reclaimed;          // phase F: the flag was set and nothing blocked a pass (no pending sub-process, arena layer free)
 } mi_purge_all_report_t;
 
 #define MI_PURGE_OK       0   // every registered thread was reached

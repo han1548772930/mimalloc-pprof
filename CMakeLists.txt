@@ -89,6 +89,7 @@ set(mi_sources
     src/alloc-aligned.c
     src/alloc-posix.c
     src/arena.c
+    src/arena-reclaim.c
     src/bitmap.c
     src/heap.c
     src/heap-dump.c
@@ -2039,6 +2040,39 @@ if (MI_BUILD_TESTS)
                          ENVIRONMENT "MIMALLOC_SCAVENGER=0")
   endif()
 
+  # test-arena-reclaim: the free-arena reclaim behind `mi_purge_all_ex(MI_PURGE_RECLAIM)`,
+  # the rows A1-A6 of docs/arena-reclaim.md. The row lowers `mi_option_arena_reserve` to its
+  # 32 MiB minimum so that one 32 MiB object forces one 96 MiB arena of its own, then asserts on
+  # the arena accounting: the control (nothing moves without the flag), the reclaim itself, the
+  # metadata following the live set instead of the process peak, a thread inside the allocator
+  # forbidding the pass, and a parked thread not blocking it. That accounting is process-wide,
+  # so the row is in the
+  # RUN_SERIAL group below. C++ and static-only for the same two reasons as test-purge-holes
+  # above: it reaches `mimalloc/internal.h` for the accounting, and `_mi_...` symbols are hidden
+  # in a shared build (`ctest-shared` skips it rather than failing to link).
+  if(mi_have_cxx_for_tests AND MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-reclaim test/test-arena-reclaim.cpp)
+    target_compile_definitions(mimalloc-test-arena-reclaim PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-reclaim PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-reclaim PRIVATE include)
+    # MI_STATIC_LIB: the internal declarations this test uses resolve through
+    # `__declspec(dllimport)` on MSVC without it (see test-purge-holes above).
+    target_compile_definitions(mimalloc-test-arena-reclaim PRIVATE MI_STATIC_LIB)
+    if(MI_USE_CXX)
+      # MI_USE_CXX is a CMake choice, not a `mi_defines` entry, and the test has to know it:
+      # a C++-compiled library mangles the internal declarations, so the `extern "C"` wrapper
+      # around its include of `mimalloc/internal.h` must be dropped (see the test source).
+      target_compile_definitions(mimalloc-test-arena-reclaim PRIVATE MI_USE_CXX)
+    endif()
+    target_link_libraries(mimalloc-test-arena-reclaim PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-arena-reclaim PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-arena-reclaim COMMAND mimalloc-test-arena-reclaim)
+    set_tests_properties(test-arena-reclaim PROPERTIES TIMEOUT 300)
+  endif()
+
   # macOS VM tag must be application-specific (issue #78).
   add_executable(mimalloc-test-os-tag test/test-os-tag.c)
   target_compile_definitions(mimalloc-test-os-tag PRIVATE ${mi_defines})
@@ -2230,6 +2264,10 @@ set(mi_serial_tests
   # "a wall-clock deadline" measurements that an oversubscribed wave would turn into noise.
   test-purge-all
   test-purge-all-no-scavenger
+  # The free-arena reclaim's rows assert on PROCESS-WIDE arena accounting -- A1 requires it to
+  # start at zero, and the reclaim releases every completely free arena of the process -- so no
+  # other test may be reserving or releasing arenas while they run.
+  test-arena-reclaim
   # #371: a scaling RATIO is only meaningful with the machine to itself; an oversubscribed
   # wave would turn it into noise and, worse, into a flaky gate.
   test-observer-scaling

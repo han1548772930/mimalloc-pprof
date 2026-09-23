@@ -1907,7 +1907,7 @@ static mi_bitmap_t* mi_arena_pages_abandoned_ensure(mi_arena_t* arena, mi_arena_
 // per-bin bitmaps alive -- but only because this free is in `mi_heap_free` and not earlier: a
 // future refactor must not move it up.
 // Bun parity P10b, #317, ported from oven-sh/mimalloc @ 787be2a8, MIT.
-static void mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages) {
+void _mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages) {
   for (size_t bin = 0; bin < MI_ARENA_BIN_COUNT; bin++) {
     if (mi_atomic_load_ptr_relaxed(mi_bitmap_t, &arena_pages->pages_abandoned[bin]) == NULL) continue;  // the common case
     mi_bitmap_t* bitmap = mi_atomic_exchange_ptr_acq_rel(mi_bitmap_t, &arena_pages->pages_abandoned[bin], NULL);
@@ -1920,7 +1920,7 @@ static void mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages) {
 // where `heap` is in scope; this function itself has no handle to the owning heap.
 void _mi_arena_pages_free(mi_arena_pages_t* arena_pages) {
   if (arena_pages == NULL) return;
-  mi_arena_pages_free_abandoned(arena_pages);
+  _mi_arena_pages_free_abandoned(arena_pages);
   _mi_free_subproc_safe(arena_pages);
 }
 
@@ -2686,6 +2686,18 @@ bool _mi_arenas_purge_guard_reset(void) {
 // #272: called from `_mi_process_fork_child`, on the single surviving thread.
 void _mi_arenas_fork_child(void) {
   _mi_arenas_purge_guard_reset();
+}
+
+// The empty-arena reclaim (src/arena-reclaim.c) holds the purge guard for its whole pass,
+// so the background scavenger's timer skips its arena purge while an arena is being released
+// (`mi_atomic_guard` is non-blocking). NOT a `mi_atomic_guard` block: the critical section
+// spans a whole function call, and the reclaim may not be entered recursively.
+bool _mi_arenas_purge_guard_acquire(void) {
+  return (mi_atomic_exchange_acq_rel(&mi_arenas_purge_guard, (uintptr_t)1) == 0);
+}
+
+void _mi_arenas_purge_guard_release(void) {
+  mi_atomic_store_release(&mi_arenas_purge_guard, (uintptr_t)0);
 }
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a).

@@ -31,6 +31,7 @@ busy threads too (paced by `purge_holes_min_interval`, bounded per visit by
 ```c
 typedef enum mi_purge_flags_e {
   MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed sweep runs to completion
+  MI_PURGE_RECLAIM = 2, // also give back every arena that is COMPLETELY free, metadata included
 } mi_purge_flags_t;
 
 typedef struct mi_purge_all_report_s {
@@ -41,6 +42,11 @@ typedef struct mi_purge_all_report_s {
   size_t theaps_orphaned;    // pre-fork threads that vanished in a fork child; never touched
   bool   gated;              // built with MI_OWNER_GATE (a configuration fact, not completion)
   bool   complete;           // theaps_pending == 0 && theaps_orphaned == 0
+  size_t arenas_reclaimed;   // arenas released to the OS, their metadata included
+  size_t arena_reclaim_bytes;// the reservation bytes those arenas held
+  size_t arenas_kept;        // seen completely free and NOT released (not ours to give back)
+  size_t subprocs_pending;   // sub-processes whose threads could not all be claimed at once
+  bool   reclaimed;          // the flag was passed and nothing blocked a pass
 } mi_purge_all_report_t;
 
 #define MI_PURGE_OK       0
@@ -118,6 +124,50 @@ cutoff), so thread churn cannot extend a call; the next iteration sees them.
 
 Without `FORCE`, pacing applies and a sweep is bounded by `park_reclaim`, exactly as
 when the scavenger visits.
+
+### `MI_PURGE_RECLAIM`
+
+Also give back the arenas that are **completely free** — their metadata included — instead
+of leaving them to the process lifetime (phase F of the implementation; full description:
+[docs/arena-reclaim.md](arena-reclaim.md)).
+
+This is the half `mi_purge_all` itself does not do: the arena passes return the *contents*
+of the arenas, but an arena's own bookkeeping (`pages_meta`, one `mi_page_t` per slice,
+2.8 MiB per GiB of arena, committed when the arena is created) stays as long as the arena
+does. A long-running service keeps the metadata of its **worst moment** that way, at the
+widest per-arena size it ever needed.
+
+Releasing an arena is not a purge: its bitmaps and its slot in the sub-process's arena
+table are lock-free state that any allocation can reach, so the flag requires **every
+thread of the sub-process to be out of the allocator at one and the same instant** —
+proof, not a heuristic. It gets that from the same park protocol the purge already uses:
+every registered thread is claimed at once (in a gated build every thread outside an
+allocator call; otherwise the threads parked in `mi_on_thread_idle_start()`), and a
+thread that is *inside* the allocator makes the pass refuse — its sub-process is counted
+in `subprocs_pending` and **nothing is released there**. `wait_ms` bounds the retry for a
+thread that is merely between two allocator calls (bounded waiting, as everywhere else;
+the plan is in [docs/purge-all-implementation.md](purge-all-implementation.md) §7.2).
+
+So the call stays what it was — never blocking, never waiting on a lock it holds — and
+`reclaimed` tells you whether the extra pass ran; `arenas_reclaimed` /
+`arena_reclaim_bytes` tell you what it returned. `arenas_kept` counts the completely free
+arenas it deliberately does **not** release (an `exclusive` reservation whose
+`mi_arena_id_t` you may still hold, pinned memory, memory you manage yourself).
+
+```c
+#include <mimalloc.h>
+
+/* From an idle point: hand back the arenas the peak left behind. Best effort by
+   construction -- re-run it later if `reclaimed` is false. */
+static size_t reclaim_at_idle(void) {
+  mi_purge_all_report_t r;
+  mi_purge_all_ex((mi_purge_flags_t)(MI_PURGE_FORCE | MI_PURGE_RECLAIM), 100, &r);
+  return r.arenas_reclaimed;
+}
+```
+
+Without the flag the behaviour is exactly the behaviour before this flag: nothing is ever
+given back until the process exits. `mi_purge_all(force)` never reclaims.
 
 ### Fork orphans
 

@@ -1221,6 +1221,19 @@ option with a measured fast-path cost. Contract and numbers:
 [docs/purge-all.md](docs/purge-all.md); implementation:
 [#366](https://github.com/zackees/mimalloc-pprof/issues/366).
 
+One more piece of memory return is behind the same call:
+`mi_purge_all_ex(flags | MI_PURGE_RECLAIM)`
+(see [docs/arena-reclaim.md](docs/arena-reclaim.md)) gives back the arenas that are **completely
+free**, their metadata included. That is the part a service keeps after a spike: an arena's
+`pages_meta` is one `mi_page_t` per slice — 2.8 MiB per GiB of arena — committed when the
+arena is created, and nothing else in the library returns it before the process exits; the
+peak's arenas stay committed until a restart. Releasing one requires proof that
+every thread of the sub-process is out of the allocator at the same instant — the same park
+protocol the purge uses, claimed all at once — so a busy sub-process is reported in
+`subprocs_pending` and simply not reclaimed; the call never blocks and never waits on a lock
+it holds. Ungated builds reclaim from parked threads; `MI_OWNER_GATE=ON` reclaims as soon as
+no allocator call is in flight.
+
 ---
 
 ## Documentation
@@ -1232,6 +1245,7 @@ option with a measured fast-path cost. Contract and numbers:
 | [docs/profiler.md](docs/profiler.md) | Profiler reference: cost, env vars, seeding, embedded-mimalloc concerns, exact stats |
 | [docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md) | Exact DHAT profiling and the memory-events API |
 | [docs/purge-all.md](docs/purge-all.md) | `mi_purge_all` / `MI_OWNER_GATE`: process-wide purge from any thread — contract, return codes, measured reach and cost |
+| [docs/arena-reclaim.md](docs/arena-reclaim.md) | `MI_PURGE_RECLAIM`: giving back the arenas that are completely free, metadata included — mechanism, quiescence proof, limits, tests |
 | [docs/benchmarks.md](docs/benchmarks.md) | Benchmark methodology, thread-scaling panels, metric roadmap |
 | [docs/upstream-bugs.md](docs/upstream-bugs.md) | The upstream bugs in depth, and how they are kept fixed |
 | [docs/ci-gates.md](docs/ci-gates.md) | Every CI gate, what it catches, and its positive control |

@@ -287,6 +287,57 @@ Rules the loop encodes:
 - In an ungated build the same loop runs; every `RUNNING` tld is stamped pending on the
   first pass (no owner will ever park), so `wait_ms` is not consumed.
 
+### 7.2 Phase F, `MI_PURGE_RECLAIM`
+
+After E, when the caller passed the flag, release every arena of every sub-process that is
+**completely free**. Implementation: `src/arena-reclaim.c` (new file; included from
+`src/static.c` unconditionally, like this driver); the contract is
+`docs/arena-reclaim.md`.
+
+```
+A. for each subproc: _mi_arenas_try_purge / _mi_arenas_purge_now     (unchanged)
+B. abandoned holes per heap, under heaps_lock                        (unchanged)
+C. my own tld: mi_theap_collect_ex + _mi_purge_holes_of               (unchanged)
+D. the walk above                                                    (unchanged)
+E. one final arena pass per subproc so D's pages leave now           (unchanged)
+F. when the flag is set: my_tld = the calling thread's tld, under mi_subprocs_lock:
+     while now < deadline:                        // retry for a RUNNING owner between calls
+       if !_mi_arenas_purge_guard_acquire(): layer_busy; retry      // scavenger's timer is on it
+       else:
+         for each subproc sp:
+           mi_lock(sp->heaps_lock):
+             mi_lock(sp->tlds_lock):
+               if !claim EVERY tld of sp (PARKED -> SWEEPING, minus my_tld, minus orphans,
+                                          minus the scavenger tld):
+                 release the claims taken; subprocs_pending++; continue
+               mi_lock(sp->theap_meta_lock): for each arena: release it if it is empty
+                                              (hand back the per-heap tracking first)
+               per-heap leftovers, then release every claim
+         release the purge guard; break when subprocs_pending == 0
+       spin 256x, then yield
+```
+
+Why a *claim of all of them* rather than the walk's one-at-a-time claim: releasing an arena
+touches state no page path owns — `subproc->arenas[]` (walked lock-free by
+`mi_arenas_try_find_free`) and the arena's own bitmaps (`mi_arena_try_alloc_at` claims
+slices with an atomic bbitmap clear). A thread inside an allocator call has park_state
+`RUNNING` and cannot be claimed, so the sub-process is reported pending and nothing is
+freed; a claimed owner blocks in `_mi_park_leave`/`_mi_park_leave_gate` until the claim is
+released, which is what keeps the claimed tlds alive for the pass.
+
+The two doors that are not park-based are held for the whole pass: `sp->theap_meta_lock`
+(a thread that does not exist yet bootstraps through `_mi_meta_zalloc` before it is
+registered in `sp->tlds`; every meta allocation holds that lock across the allocation) and
+the arena purge guard (`mi_scavenger_run` -> `_mi_arenas_try_purge` has no claim at all and
+would read the bitmaps of the arena being freed; `mi_atomic_guard` is non-blocking, so it
+skips). Lock order is the documented one, `heaps -> tlds -> theap_meta`, with the guard as
+a leaf; nothing in the pass waits for a lock it holds. In a gated build our own tld is
+inside the gate around the pass (`MI_GATE_ENTER/LEAVE`), which is what keeps the scavenger
+from claiming *us*.
+
+`wait_ms` bounds only the retry for a `RUNNING` owner; a pass that got its claims runs to
+completion. `subprocs_pending == 0 && !layer_busy` is reported as `reclaimed`.
+
 ## 8. Fork (`src/fork.c`)
 
 - `_mi_process_fork_prepare` already `_mi_park_leave`s the caller's tld; in a gated build

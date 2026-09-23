@@ -1417,6 +1417,21 @@ void          _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep
 void          _mi_purge_holes_report_collect(mi_holes_report_t* rep);
 void          _mi_arenas_purge_abandoned_holes(mi_heap_t* heap, mi_tld_t* tld);   // src/arena.c
 
+// The free-arena reclaim (src/arena-reclaim.c, phase F of `mi_purge_all_ex`): give back the
+// arenas that are completely free. The report is filled in even when it is a no-op.
+typedef struct mi_arena_reclaim_report_s {
+  size_t arenas_reclaimed;    // arenas released to the OS (metadata included)
+  size_t reclaim_bytes;       // their reserved size, in bytes
+  size_t arenas_kept;         // arenas seen completely free but not released
+  size_t subprocs_pending;    // sub-processes whose threads could not all be claimed: nothing released there
+  bool   layer_busy;          // an attempt found the arena purge guard held: nothing was released for it
+} mi_arena_reclaim_report_t;
+
+void          _mi_arenas_reclaim_now(mi_tld_t* my_tld, size_t wait_ms, mi_arena_reclaim_report_t* rep);  // src/arena-reclaim.c
+void          _mi_arena_pages_free_abandoned(mi_arena_pages_t* arena_pages);              // src/arena.c
+bool          _mi_arenas_purge_guard_acquire(void);   // src/arena.c: the guard held across a reclaim
+void          _mi_arenas_purge_guard_release(void);   // src/arena.c
+
 // The base of the OS-page bitmap: the start of the first OS page that the block area of
 // this page overlaps. It is OS-page aligned by construction, so bit `k` always names the
 // OS-page-aligned range `[base + k*os_page_size, base + (k+1)*os_page_size)`.
