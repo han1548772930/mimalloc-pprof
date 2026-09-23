@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from copy import deepcopy
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +77,16 @@ def fixture_data() -> dict[str, Any]:
                 records.append(record)
     return {
         "schema": "arena-reclaim-v1",
+        "is_baseline": False,
         "source_sha": "a" * 40,
+        "benchmark_source_sha256": {
+            name: sha256((ROOT / name).read_bytes()).hexdigest()
+            for name in (
+                "ci/bench_arena_reclaim.c",
+                "ci/bench_arena_reclaim.py",
+                "ci/arena_reclaim_bench/CMakeLists.txt",
+            )
+        },
         "host": {"platform": "fixture"},
         "records": records,
     }
@@ -90,6 +100,32 @@ def test_rejects_missing_reclaim_marker() -> None:
     except (ValueError, KeyError):
         return
     raise AssertionError("missing reclaim marker was accepted")
+
+
+def test_rejects_missing_no_op_reason() -> None:
+    data = fixture_data()
+    for record in data["records"]:
+        if record["scenario"] == "nonempty" and record["mode"] == "reclaim":
+            del record["samples"][4]["reclaim_result"]
+            break
+    try:
+        validate_report(data)
+    except ValueError:
+        return
+    raise AssertionError("missing no-op reason was accepted")
+
+
+def test_baseline_skips_unsafe_retained_id_only() -> None:
+    data = fixture_data()
+    data["is_baseline"] = True
+    data["records"] = [r for r in data["records"] if r["scenario"] != "retained-id"]
+    validate_report(data)
+    data["records"] = [r for r in data["records"] if r["scenario"] != "nonempty"]
+    try:
+        validate_report(data)
+    except ValueError:
+        return
+    raise AssertionError("incomplete baseline scenario matrix was accepted")
 
 
 def test_figure_does_not_label_reservation_as_rss() -> None:
@@ -111,4 +147,23 @@ def test_stale_render_is_red(tmp_path: Path) -> None:
     subprocess.run([*command, "--render"], check=True)
     subprocess.run([*command, "--check"], check=True)
     (tmp_path / "arena-reclaim-timeline.svg").write_text("stale", encoding="utf-8")
+    assert subprocess.run([*command, "--check"], capture_output=True).returncode != 0
+
+
+def test_changed_raw_data_makes_render_stale(tmp_path: Path) -> None:
+    data = tmp_path / "results.json"
+    report = fixture_data()
+    data.write_text(json.dumps(report), encoding="utf-8")
+    command = [sys.executable, str(SCRIPT), "--data", str(data), "--out-dir", str(tmp_path)]
+    subprocess.run([*command, "--render"], check=True)
+    for record in report["records"]:
+        if (
+            record["owner_gate"] is False
+            and record["purge_decommits"] == "1"
+            and record["scenario"] == "empty"
+            and record["thread_state"] == "none"
+            and record["mode"] == "reclaim"
+        ):
+            record["samples"][4]["rss_bytes"] += 1048576
+    data.write_text(json.dumps(report), encoding="utf-8")
     assert subprocess.run([*command, "--check"], capture_output=True).returncode != 0

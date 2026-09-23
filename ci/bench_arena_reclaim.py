@@ -18,13 +18,14 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA = ROOT / ".github/assets/arena-reclaim-results.json"
 MODES = ("purge-only", "reclaim")
 SCENARIOS = ("empty", "nonempty", "retained-id")
+BASELINE_SCENARIOS = ("empty", "nonempty")
 THREAD_STATES = ("none", "idle", "active")
 PHASES = ("baseline", "peak", "free", "purge", "reclaim", "peak", "free", "purge", "reclaim")
 METRICS = (
@@ -46,7 +47,9 @@ def run(command: list[str], *, cwd: Path = ROOT) -> str:
     return result.stdout
 
 
-def build(root: Path, owner_gate: bool, toolchain: str) -> tuple[Path, list[str]]:
+def build(
+    root: Path, owner_gate: bool, toolchain: str, allocator_source: Path
+) -> tuple[Path, list[str]]:
     directory = root / ("owner-gate-on" if owner_gate else "owner-gate-off")
     flags = [
         "-DCMAKE_BUILD_TYPE=Release",
@@ -55,6 +58,7 @@ def build(root: Path, owner_gate: bool, toolchain: str) -> tuple[Path, list[str]
         "-DMI_BUILD_OBJECT=OFF",
         "-DMI_PPROF=OFF",
         f"-DMI_OWNER_GATE={'ON' if owner_gate else 'OFF'}",
+        f"-DMI_BENCH_ALLOCATOR_SOURCE={allocator_source.resolve()}",
     ]
     generator = [] if toolchain == "msvc" else ["-G", "Ninja"]
     run(
@@ -156,14 +160,24 @@ def validate_samples(
 
 
 def measure(
-    build_root: Path, runs: int, decommits: tuple[str, ...], toolchain: str
+    build_root: Path,
+    runs: int,
+    decommits: tuple[str, ...],
+    toolchain: str,
+    allocator_source: Path,
+    allocator_source_sha: str | None,
 ) -> dict[str, Any]:
     if runs < 3:
         raise ValueError("at least three paired repetitions are required")
     sha = os.environ.get("GITHUB_SHA") or run(["git", "rev-parse", "HEAD"]).strip()
+    if allocator_source.resolve() != ROOT.resolve() and not allocator_source_sha:
+        raise ValueError("a separate allocator checkout requires --allocator-source-sha")
+    is_baseline = allocator_source.resolve() != ROOT.resolve()
     report: dict[str, Any] = {
         "schema": "arena-reclaim-v1",
         "source_sha": sha,
+        "allocator_source_sha": allocator_source_sha or sha,
+        "is_baseline": is_baseline,
         "benchmark_source_sha256": {
             name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
             for name in (
@@ -195,9 +209,9 @@ def measure(
         "records": [],
     }
     for owner_gate in (False, True):
-        exe, flags = build(build_root, owner_gate, toolchain)
+        exe, flags = build(build_root, owner_gate, toolchain, allocator_source)
         for decommit in decommits:
-            for scenario in SCENARIOS:
+            for scenario in BASELINE_SCENARIOS if is_baseline else SCENARIOS:
                 for thread_state in THREAD_STATES:
                     for repeat in range(runs):
                         # Alternate order to reduce systematic cache/temperature bias.
@@ -243,7 +257,10 @@ def measure(
 def validate_report(data: dict[str, Any]) -> None:
     if data.get("schema") != "arena-reclaim-v1" or not isinstance(data.get("records"), list):
         raise ValueError("invalid arena-reclaim data schema")
-    if len(data["records"]) < 3 * 2 * 2 * len(SCENARIOS) * len(THREAD_STATES) * len(MODES):
+    if type(data.get("is_baseline")) is not bool:
+        raise ValueError("missing baseline marker")
+    scenarios = BASELINE_SCENARIOS if data["is_baseline"] else SCENARIOS
+    if len(data["records"]) < 3 * 2 * 2 * len(scenarios) * len(THREAD_STATES) * len(MODES):
         raise ValueError("insufficient raw paired repetitions")
     grouped: dict[tuple[bool, str, str, str, int], set[str]] = {}
     seen: set[tuple[bool, str, str, str, int, str]] = set()
@@ -251,7 +268,7 @@ def validate_report(data: dict[str, Any]) -> None:
     for record in data["records"]:
         mode, scenario = record["mode"], record["scenario"]
         thread_state = record["thread_state"]
-        if mode not in MODES or scenario not in SCENARIOS or thread_state not in THREAD_STATES:
+        if mode not in MODES or scenario not in scenarios or thread_state not in THREAD_STATES:
             raise ValueError("unknown mode/scenario")
         if type(record["owner_gate"]) is not bool or record["purge_decommits"] not in ("0", "1"):
             raise ValueError("invalid owner-gate/decommit configuration")
@@ -280,9 +297,24 @@ def validate_report(data: dict[str, Any]) -> None:
         raise ValueError("unpaired run")
     if len(repeats) < 3 or repeats != set(range(len(repeats))):
         raise ValueError("expected at least three consecutive raw repetitions")
-    expected = set(itertools.product((False, True), ("0", "1"), SCENARIOS, THREAD_STATES, repeats))
+    expected = set(itertools.product((False, True), ("0", "1"), scenarios, THREAD_STATES, repeats))
     if set(grouped) != expected:
         raise ValueError("missing owner-gate/decommit/scenario/thread/repetition arm")
+
+
+def validate_source_pins(data: dict[str, Any]) -> None:
+    pins_raw = data.get("benchmark_source_sha256")
+    if not isinstance(pins_raw, dict):
+        raise ValueError("missing benchmark source pins")
+    pins = cast(dict[str, str], pins_raw)
+    for name in (
+        "ci/bench_arena_reclaim.c",
+        "ci/bench_arena_reclaim.py",
+        "ci/arena_reclaim_bench/CMakeLists.txt",
+    ):
+        actual = hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+        if pins.get(name) != actual:
+            raise ValueError(f"stale benchmark source pin: {name}")
 
 
 def svg(data: dict[str, Any], kind: str) -> str:
@@ -360,8 +392,8 @@ def svg(data: dict[str, Any], kind: str) -> str:
             for i in range(9)
         ]
     lines = [
-        '<svg xmlns="http://www.w3.org/2000/svg" width="960" height="460" viewBox="0 0 960 460">',
-        '<rect width="960" height="460" fill="#fff"/>',
+        '<svg xmlns="http://www.w3.org/2000/svg" width="960" height="480" viewBox="0 0 960 480">',
+        '<rect width="960" height="480" fill="#fff"/>',
     ]
     title = (
         "Arena reclaim: physical memory by phase"
@@ -436,6 +468,8 @@ def main() -> None:
     operation.add_argument("--render", action="store_true")
     operation.add_argument("--check", action="store_true")
     parser.add_argument("--build-root", type=Path)
+    parser.add_argument("--allocator-source", type=Path, default=ROOT)
+    parser.add_argument("--allocator-source-sha")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
     parser.add_argument("--out-dir", type=Path, default=ROOT / ".github/assets")
     parser.add_argument("--runs", type=int, default=3)
@@ -454,6 +488,8 @@ def main() -> None:
             args.runs,
             ("1", "0") if args.decommits == "both" else (args.decommits,),
             args.toolchain,
+            args.allocator_source,
+            args.allocator_source_sha,
         )
         validate_report(data)
         args.data.parent.mkdir(parents=True, exist_ok=True)
@@ -461,6 +497,7 @@ def main() -> None:
         return
     data = json.loads(args.data.read_text(encoding="utf-8"))
     validate_report(data)
+    validate_source_pins(data)
     for kind in ("timeline", "tradeoff"):
         path = args.out_dir / f"arena-reclaim-{kind}.svg"
         rendered = svg(data, kind)
