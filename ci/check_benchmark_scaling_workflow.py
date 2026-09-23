@@ -123,9 +123,7 @@ def validate(workflow: Mapping[str, object]) -> None:
         timeout = job.get("timeout-minutes")
         limit = MEASURE_TIMEOUT_MINUTES if name == "measure" else MAXIMUM_BUILD_TIMEOUT_MINUTES
         if not isinstance(timeout, int) or timeout > limit:
-            fail(
-                f"workflow.jobs.{name}.timeout-minutes: expected <={limit}"
-            )
+            fail(f"workflow.jobs.{name}.timeout-minutes: expected <={limit}")
         if "strategy" in job:
             fail(f"workflow.jobs.{name}: parallel matrices are forbidden; measure on one host")
         steps_by_name(job)
