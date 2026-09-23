@@ -200,6 +200,13 @@ def validate(workflow: Mapping[str, object]) -> None:
     raw_with = mapping(raw.get("with"), "upload raw scaling artifact.with")
     if raw_with.get("retention-days") != 30 or raw_with.get("include-hidden-files") is not True:
         fail("raw scaling artifact must retain all bytes for 30 days")
+    raw_name = raw_with.get("name")
+    merged_raw = mapping(assemble_steps.get("upload merged raw scaling artifact"), "merged raw")
+    merged_name = mapping(merged_raw.get("with"), "merged raw.with").get("name")
+    if not isinstance(raw_name, str) or "benchmark-scaling-shards-" not in raw_name:
+        fail("measurement shards require a dedicated raw artifact")
+    if raw_name == merged_name:
+        fail("measurement shards and merged raw report must use distinct artifacts")
     eligibility = mapping(assemble_steps.get("compute publication eligibility"), "eligibility")
     eligibility_run = eligibility.get("run")
     if not isinstance(eligibility_run, str):

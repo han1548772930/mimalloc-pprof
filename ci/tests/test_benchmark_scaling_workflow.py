@@ -92,6 +92,16 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(policy.ScalingWorkflowError, "30"):
             policy.validate(value)
 
+    def test_measure_budget_above_approved_120_minutes_is_rejected(self) -> None:
+        value = self.workflow()
+        jobs = value["jobs"]
+        assert isinstance(jobs, dict)
+        measure = jobs["measure"]
+        assert isinstance(measure, dict)
+        measure["timeout-minutes"] = 121
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "120"):
+            policy.validate(value)
+
     def test_parallel_matrix_is_rejected(self) -> None:
         value = self.workflow()
         jobs = value["jobs"]
@@ -162,6 +172,22 @@ class BenchmarkScalingWorkflowTests(unittest.TestCase):
         assert isinstance(raw_with, dict)
         raw_with["retention-days"] = 1
         with self.assertRaisesRegex(policy.ScalingWorkflowError, "30 days"):
+            policy.validate(value)
+
+    def test_shard_artifact_cannot_overwrite_merged_raw_report(self) -> None:
+        value = self.workflow()
+        jobs = value["jobs"]
+        assert isinstance(jobs, dict)
+        measure = jobs["measure"]
+        assemble = jobs["assemble"]
+        assert isinstance(measure, dict) and isinstance(assemble, dict)
+        raw = policy.steps_by_name(measure)["upload raw scaling shard"]
+        merged = policy.steps_by_name(assemble)["upload merged raw scaling artifact"]
+        raw_with = raw["with"]
+        merged_with = merged["with"]
+        assert isinstance(raw_with, dict) and isinstance(merged_with, dict)
+        raw_with["name"] = merged_with["name"]
+        with self.assertRaisesRegex(policy.ScalingWorkflowError, "dedicated raw artifact|distinct"):
             policy.validate(value)
 
 
