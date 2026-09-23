@@ -878,6 +878,14 @@ def run_lint(ctx: RunCtx) -> bool:
         ["uv", "run", "ci/bench_hole_purging.py", "--check", "--table"],
         ["uv", "run", "ci/bench_hole_purging_allocators.py", "--check"],
         ["uv", "run", "ci/bench_hole_purging_allocators.py", "--check", "--table"],
+        [
+            "uv",
+            "run",
+            "ci/bench_arena_reclaim.py",
+            "--check",
+            "--data",
+            ".github/assets/arena-reclaim-linux-pr.json",
+        ],
         # Same idea for the README's allocator feature table and its two SVGs: they
         # render from docs/allocator-features.json, and `--check` fails if any of the
         # three has drifted from it.

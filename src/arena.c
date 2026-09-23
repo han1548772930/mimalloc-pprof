@@ -322,7 +322,7 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
 }
 
 
-static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool commit, bool allow_large, bool exclusive, mi_arena_id_t* arena_id);
+static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool commit, bool allow_large, bool exclusive, bool auto_reserved, mi_arena_id_t* arena_id);
 
 // try to reserve a fresh arena space
 static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_large, mi_arena_id_t* arena_id)
@@ -378,7 +378,7 @@ static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_
   const bool adjust = (overcommit && arena_commit);
   if (adjust) { mi_subproc_stat_adjust_decrease( subproc, committed, arena_reserve); }
   // and try to reserve the arena
-  int err = mi_reserve_os_memory_ex2(subproc, arena_reserve, arena_commit, allow_large, false /* exclusive? */, arena_id);
+  int err = mi_reserve_os_memory_ex2(subproc, arena_reserve, arena_commit, allow_large, false /* exclusive? */, true /* auto_reserved */, arena_id);
   if (err != 0) {
     if (adjust) { mi_subproc_stat_adjust_increase( subproc, committed, arena_reserve); } // roll back
     // failed to allocate: try a smaller size arena as fallback?
@@ -386,7 +386,7 @@ static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_
     if (arena_reserve > small_arena_reserve && small_arena_reserve > req_size) {
       // try again
       if (adjust) { mi_subproc_stat_adjust_decrease(subproc, committed, small_arena_reserve); }
-      err = mi_reserve_os_memory_ex2(subproc, small_arena_reserve, arena_commit, allow_large, false /* exclusive? */, arena_id);
+      err = mi_reserve_os_memory_ex2(subproc, small_arena_reserve, arena_commit, allow_large, false /* exclusive? */, true /* auto_reserved */, arena_id);
       if (err != 0 && adjust) { mi_subproc_stat_adjust_increase( subproc, committed, small_arena_reserve); } // roll back
     }
   }
@@ -1926,7 +1926,7 @@ void _mi_arena_pages_free(mi_arena_pages_t* arena_pages) {
 
 static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
                                         size_t slice_count, mi_arena_t* parent, size_t total_size,
-                                        int numa_node, bool exclusive,
+                                        int numa_node, bool exclusive, bool auto_reserved,
                                         mi_memid_t memid, mi_commit_fun_t* commit_fun, void* commit_fun_arg, mi_arena_id_t* arena_id)
 {
   mi_assert_internal(_mi_is_aligned(start,MI_ARENA_SLICE_ALIGN));
@@ -1981,6 +1981,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   arena->subproc = subproc;
   arena->memid = memid;
   arena->is_exclusive = exclusive;
+  arena->is_auto_reserved = auto_reserved;
   arena->slice_count = slice_count;
   arena->info_slices = info_slices;
   if (numa_node<0 && mi_option_is_enabled(mi_option_arena_is_numa_local)) {
@@ -2039,7 +2040,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   return arena;
 }
 
-static bool mi_manage_os_memory_ex2(mi_subproc_t* subproc, void* start, size_t size, int numa_node, bool exclusive,
+static bool mi_manage_os_memory_ex2(mi_subproc_t* subproc, void* start, size_t size, int numa_node, bool exclusive, bool auto_reserved,
   mi_memid_t memid, mi_commit_fun_t* commit_fun, void* commit_fun_arg, mi_arena_id_t* arena_id) mi_attr_noexcept
 {
   // checks
@@ -2077,7 +2078,7 @@ static bool mi_manage_os_memory_ex2(mi_subproc_t* subproc, void* start, size_t s
 
     // initialize
     mi_arena_t* arena = mi_arena_initialize( subproc, start, slice_count, parent,
-                                              (parent==NULL ? total_size : 0), numa_node, exclusive,
+                                              (parent==NULL ? total_size : 0), numa_node, exclusive, auto_reserved,
                                               memid, commit_fun, commit_fun_arg,
                                               (parent==NULL ? arena_id : NULL));
     if (arena==NULL) {
@@ -2115,7 +2116,7 @@ bool mi_manage_os_memory_ex(void* start, size_t size, bool is_committed, bool is
   memid.initially_committed = is_committed;
   memid.initially_zero = is_zero;
   memid.is_pinned = is_pinned;
-  return mi_manage_os_memory_ex2(_mi_subproc(), start, size, numa_node, exclusive, memid, NULL, NULL, arena_id);
+  return mi_manage_os_memory_ex2(_mi_subproc(), start, size, numa_node, exclusive, false /* auto_reserved */, memid, NULL, NULL, arena_id);
 }
 
 bool mi_manage_memory(void* start, size_t size, bool is_committed, bool is_pinned, bool is_zero, int numa_node, bool exclusive, mi_commit_fun_t* commit_fun, void* commit_fun_arg, mi_arena_id_t* arena_id) mi_attr_noexcept
@@ -2126,12 +2127,12 @@ bool mi_manage_memory(void* start, size_t size, bool is_committed, bool is_pinne
   memid.initially_committed = is_committed;
   memid.initially_zero = is_zero;
   memid.is_pinned = is_pinned;
-  return mi_manage_os_memory_ex2(_mi_subproc(), start, size, numa_node, exclusive, memid, commit_fun, commit_fun_arg, arena_id);
+  return mi_manage_os_memory_ex2(_mi_subproc(), start, size, numa_node, exclusive, false /* auto_reserved */, memid, commit_fun, commit_fun_arg, arena_id);
 }
 
 
 // Reserve a range of regular OS memory
-static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool commit, bool allow_large, bool exclusive, mi_arena_id_t* arena_id) {
+static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool commit, bool allow_large, bool exclusive, bool auto_reserved, mi_arena_id_t* arena_id) {
   if (arena_id != NULL) *arena_id = _mi_arena_id_none();
   if (size <= MI_MAX_ALLOC_SIZE) {
     size = _mi_align_up(size, MI_ARENA_SLICE_SIZE); // at least one slice
@@ -2143,7 +2144,7 @@ static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool com
   mi_memid_t memid;
   void* start = _mi_os_alloc_aligned(subproc, size, MI_ARENA_SLICE_ALIGN, commit, allow_large, &memid);
   if (start == NULL) return ENOMEM;
-  if (!mi_manage_os_memory_ex2(subproc, start, size, -1 /* numa node */, exclusive, memid, NULL, NULL, arena_id)) {
+  if (!mi_manage_os_memory_ex2(subproc, start, size, -1 /* numa node */, exclusive, auto_reserved, memid, NULL, NULL, arena_id)) {
     _mi_os_free_ex(subproc, start, size, commit, memid);
     _mi_verbose_message("failed to reserve %zu KiB memory\n", _mi_divide_up(size, 1024));
     return ENOMEM;
@@ -2156,7 +2157,7 @@ static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool com
 
 // Reserve a range of regular OS memory
 int mi_reserve_os_memory_ex(size_t size, bool commit, bool allow_large, bool exclusive, mi_arena_id_t* arena_id) mi_attr_noexcept {
-  return mi_reserve_os_memory_ex2(_mi_subproc(), size, commit, allow_large, exclusive, arena_id);
+  return mi_reserve_os_memory_ex2(_mi_subproc(), size, commit, allow_large, exclusive, false /* auto_reserved */, arena_id);
 }
 
 // Manage a range of regular OS memory
@@ -2426,7 +2427,7 @@ int mi_reserve_huge_os_pages_at_ex(size_t pages, int numa_node, size_t timeout_m
   }
   _mi_verbose_message("numa node %i: reserved %zu GiB huge pages (of the %zu GiB requested)\n", numa_node, pages_reserved, pages);
 
-  if (!mi_manage_os_memory_ex2(subproc, p, hsize, numa_node, exclusive, memid, NULL, NULL, arena_id)) {
+  if (!mi_manage_os_memory_ex2(subproc, p, hsize, numa_node, exclusive, false /* auto_reserved */, memid, NULL, NULL, arena_id)) {
     _mi_os_free(subproc, p, hsize, memid);
     return ENOMEM;
   }

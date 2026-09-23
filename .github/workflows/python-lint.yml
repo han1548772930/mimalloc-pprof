@@ -88,6 +88,7 @@ jobs:
           python3 ci/bench_hole_purging_allocators.py --check
           python3 ci/bench_hole_purging_allocators.py --check --table
           python3 ci/bench_hole_purging_allocators.py --check --busy-threads
+          python3 ci/bench_arena_reclaim.py --check --data .github/assets/arena-reclaim-linux-pr.json
 
       # Same argument, different data: the README's allocator feature table and the two
       # allocator-features SVGs are rendered from docs/allocator-features.json. Editing

@@ -117,11 +117,9 @@
        cleaned up in the same call (see `mi_arena_reclaim_release_heap_pages`).
      - The caller's own tld is deliberately NOT claimed: it is the one running this code, and
        its theaps are not swept by anyone while it holds its own gate (the driver enters it).
-     - An arena the application reserved itself (`mi_reserve_os_memory_ex`) and still holds a
-       `mi_arena_id_t` for is NOT distinguishable from one the allocator reserved, unless it was
-       reserved `exclusive` (those are skipped). Retaining an arena id across a reclaim and then
-       using it is a use-after-free; the supported pattern is `exclusive = true` for arenas whose
-       ids outlive the call.
+     - Only arenas marked `is_auto_reserved` by `mi_arena_reserve` are released. Every public
+       reserve/manage API leaves that mark false, including non-exclusive reservations whose
+       `mi_arena_id_t` may still be retained by the caller.
      - `subproc->arena_count` shrinks only when the released arena was the last slot (the same
        CAS the `mi_arena_unload` sketch at the end of src/arena.c -- currently compiled out --
        and `mi_arenas_unsafe_destroy` do), and the subproc's `arena_count` STATISTIC
@@ -175,18 +173,19 @@ static bool mi_arena_reclaim_is_empty(mi_arena_t* arena) {
 }
 
 // May we release this arena's memory at all?
-//   - `mi_memkind_is_os`: the arena came from `mi_reserve_os_memory_ex2` (either
-//     `mi_arena_reserve`'s own path or the public `mi_reserve_os_memory_ex`). MI_MEM_EXTERNAL
-//     (`mi_manage_os_memory`) and MI_MEM_STATIC memory belongs to the caller.
+//   - `is_auto_reserved`: only `mi_arena_reserve`'s own path may be released.
+//     Public OS reservations can have retained IDs even when non-exclusive.
+//   - `mi_memkind_is_os`: MI_MEM_EXTERNAL (`mi_manage_os_memory`) and MI_MEM_STATIC
+//     memory belongs to the caller.
 //   - `parent == NULL`: a sub-arena of a managed area (`mi_manage_os_memory_ex2`) is a slice of
 //     the caller's memory too.
 //   - `!is_pinned`: pinned (huge/large-page) memory cannot be handed back per page.
-//   - `!is_exclusive`: an exclusive arena is one whose `mi_arena_id_t` the caller asked for and
-//     may still hold (`mi_reserve_os_memory_ex(..., exclusive=true)`, `mi_heap_new_ex`).
+//   - `!is_exclusive`: belt-and-suspenders for arenas explicitly tied to a caller.
 // This is exactly the set `mi_arenas_unsafe_destroy` frees, plus the `is_exclusive` guard that
 // upstream's `mi_arena_unload` uses for the same reason.
 static bool mi_arena_reclaim_is_ours(mi_arena_t* arena) {
-  return (mi_memkind_is_os(arena->memid.memkind) &&
+  return (arena->is_auto_reserved &&
+          mi_memkind_is_os(arena->memid.memkind) &&
           arena->parent == NULL &&
           !arena->memid.is_pinned &&
           !arena->is_exclusive);

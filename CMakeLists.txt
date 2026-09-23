@@ -2073,7 +2073,8 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-arena-reclaim-reset COMMAND mimalloc-test-arena-reclaim)
     set_tests_properties(test-arena-reclaim-reset PROPERTIES ENVIRONMENT "MIMALLOC_PURGE_DECOMMITS=0")
     add_test(NAME test-arena-reclaim-heap-reuse COMMAND mimalloc-test-arena-reclaim --heap-reuse)
-    set_tests_properties(test-arena-reclaim test-arena-reclaim-reset test-arena-reclaim-heap-reuse PROPERTIES TIMEOUT 300)
+    add_test(NAME test-arena-reclaim-retained-id COMMAND mimalloc-test-arena-reclaim --retained-id)
+    set_tests_properties(test-arena-reclaim test-arena-reclaim-reset test-arena-reclaim-heap-reuse test-arena-reclaim-retained-id PROPERTIES TIMEOUT 300)
   endif()
 
   # macOS VM tag must be application-specific (issue #78).
@@ -2273,6 +2274,7 @@ set(mi_serial_tests
   test-arena-reclaim
   test-arena-reclaim-reset
   test-arena-reclaim-heap-reuse
+  test-arena-reclaim-retained-id
   # #371: a scaling RATIO is only meaningful with the machine to itself; an oversubscribed
   # wave would turn it into noise and, worse, into a flaky gate.
   test-observer-scaling

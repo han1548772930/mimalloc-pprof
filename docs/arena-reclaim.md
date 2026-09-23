@@ -61,7 +61,9 @@ is **completely free**:
    remaining entry in a heap's `arena_pages[idx]` and every entry of the lazy abandoned
    bitmaps that belongs to the arena. The arena must also be the library's to give back: OS
    memory (not `MI_MEM_EXTERNAL`/static), not a sub-arena of caller-managed memory, not
-   pinned, and not `exclusive` (a caller may still hold its `mi_arena_id_t`).
+   pinned, not `exclusive`, and marked `is_auto_reserved` when `mi_arena_reserve` created
+   it. Every public reserve/manage API leaves that mark false, even when non-exclusive
+   or called without an ID output, because the caller may retain a `mi_arena_id_t`.
 2. **Hand back the per-heap tracking that points into it.** Non-main heaps' empty tracking
    is detached and freed before any arena slot becomes reusable or `arena_count` shrinks.
    A replacement arena may be larger and must receive a new bitmap. Emptiness is checked
@@ -87,7 +89,7 @@ The report says what happened:
 | field | meaning |
 |---|---|
 | `arenas_reclaimed` / `arena_reclaim_bytes` | arenas released to the OS, and the reservation bytes they held |
-| `arenas_kept` | seen completely free and **not** released — not the library's to give back (the `exclusive`/pinned/external cases above) |
+| `arenas_kept` | seen completely free and **not** released — not the library's to give back (including public reservations, `exclusive`/pinned/external arenas) |
 | `subprocs_pending` | sub-processes where the proof below failed; nothing was released there |
 | `reclaimed` | the flag was passed and nothing blocked a pass (no pending sub-process, no other arena pass in flight). Says the pass *ran* — `arenas_reclaimed` says whether it found anything |
 
@@ -162,10 +164,10 @@ may take it), and the OS free is the last thing done with an arena.
 
 - It is a **flag on `mi_purge_all_ex`**, not a new entry point: that call already owns the
   purge admission and the walk, so two reclaims cannot overlap.
-- **Exclusive arenas are never released.** An arena reserved with `exclusive = true` (or a
-  `mi_arena_id_t` the caller asked for) is one the caller may still name; releasing it would
-  be a use-after-free of the *id*. Keep `exclusive = true` for arenas whose ids outlive the
-  call, or drop the id before reclaiming.
+- **Caller-reserved arenas are never released**, whether or not `exclusive = true` or an ID
+  output was requested. A caller may retain an `mi_arena_id_t` for a non-exclusive public
+  reservation; releasing that arena would make the ID a use-after-free. Only arenas created
+  automatically by the allocator are eligible.
 - A sub-process with a RUNNING owner (or an orphan tld) is **reported, not waited for**, and
   the report says so through `subprocs_pending`.
 - When the arena layer itself is busy, an attempt is skipped and retried; if the budget runs
@@ -229,6 +231,7 @@ keeps data slices committed, so reclaim may debit those slices as well as metada
 | A5 | (debug builds, `MI_DEBUG > 0`) a thread **inside** the allocator — stalled in `mi_heap_delete` between the pin and the claim — makes the pass refuse: `reclaimed == false`, nothing released, accounting untouched; once it is out, the same arena is released |
 | A6 | a live but **parked** thread (`mi_on_thread_idle_start`) does not block it: the claim protocol reaches it, and the parked thread's own allocation is never released under it |
 | A7 | `test-arena-reclaim-heap-reuse` releases a user heap's tail arena, checks that its tracking is cleared, and allocates into a larger arena reusing the same slot |
+| A8 | `test-arena-reclaim-retained-id` proves a non-exclusive public reservation and its retained ID survive a reclaim pass (the pre-fix call segfaulted) |
 
 All three builds the fork gates on are exercised locally:
 

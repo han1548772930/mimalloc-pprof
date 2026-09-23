@@ -421,8 +421,12 @@ impl PurgeFlags {
         force: true,
         reclaim: false,
     };
-    /// `MI_PURGE_RECLAIM`: also give back the arenas that are completely
-    /// free, their metadata included, instead of leaving them for the process lifetime.
+    /// `MI_PURGE_RECLAIM`: also give back completely free allocator-owned arenas,
+    /// their metadata included, instead of leaving them for the process lifetime.
+    /// An arena reserved or managed through the public C API remains pinned for the
+    /// process lifetime, even if it is non-exclusive or no arena ID was requested.
+    /// A returned `mi_arena_id_t` therefore stays valid after reclaim; there is no
+    /// public API to release the ID or unpin its arena.
     ///
     /// An arena is reserved on demand and, without this flag, nothing in the allocator
     /// ever gives one back before the process exits -- a block that leaves an arena only
@@ -440,7 +444,8 @@ impl PurgeFlags {
     /// feature that is every thread outside an allocator call; otherwise the threads
     /// parked in [`park_while_idle`]). A sub-process where that cannot be established is
     /// reported in [`PurgeAllReport::subprocs_pending`] with nothing released, and the
-    /// call is then simply a purge: it never waits on a lock it holds and never blocks.
+    /// call is then simply a purge. It may use the `wait_ms` owner-acquisition
+    /// budget, but never waits while holding the arena lock.
     ///
     /// ```no_run
     /// # use mimalloc_pprof as mi;
@@ -526,9 +531,9 @@ pub struct PurgeAllReport {
     pub arenas_reclaimed: usize,
     /// The reservation bytes those arenas held.
     pub arena_reclaim_bytes: usize,
-    /// Arenas this call saw completely free and did NOT release: memory that
-    /// is not the library's to give back -- an exclusive reservation whose `mi_arena_id_t`
-    /// the application still holds, pinned memory, or memory the application manages.
+    /// Arenas this call saw completely free and did NOT release, including all arenas
+    /// created through the public C reserve/manage APIs (with or without an arena ID,
+    /// exclusive or not). A returned `mi_arena_id_t` has no public unpin operation.
     pub arenas_kept: usize,
     /// Sub-processes whose threads could not all be claimed at one instant, so nothing was
     /// released in them. Retry at a more quiescent point; this is the same
@@ -574,8 +579,10 @@ impl From<sys::mi_purge_all_report_t> for PurgeAllReport {
 /// `madvise`/`DiscardVirtualMemory` syscalls that sweep makes, so the call can take longer
 /// than `wait_ms` once it has something to purge.
 ///
-/// With [`PurgeFlags::RECLAIM`] the same call also gives back the completely free arenas of
-/// every sub-process, their metadata included (phase F of the C implementation).
+/// With [`PurgeFlags::RECLAIM`] the same call also gives back completely free
+/// allocator-owned arenas of every sub-process, their metadata included (phase F of the
+/// C implementation). Publicly reserved/managed arenas are retained, including any
+/// whose arena IDs were returned to the application.
 /// `wait_ms` bounds that phase's own retry for a thread that is merely between two
 /// allocator calls; a sub-process whose threads are all inside the allocator at the same
 /// instant is reported in [`PurgeAllReport::subprocs_pending`] rather than waited for.

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit b72ae76e of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 7b430570 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -233,9 +233,11 @@ mi_decl_export void mi_on_thread_idle_end(void) mi_attr_noexcept;
 // registered thread's pages and holes -- and reports exactly what it could not reach.
 typedef enum mi_purge_flags_e {
   MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed sweep runs to completion (ignores park_reclaim)
-  // After the walk (phase F, docs/arena-reclaim.md): give back every arena of every sub-process
-  // that is COMPLETELY free --
-  // its metadata included (phase F, docs/arena-reclaim.md). That needs every thread of the
+  // After the walk (phase F, docs/arena-reclaim.md): give back allocator-owned arenas
+  // of every sub-process that are COMPLETELY free. Arenas created through the public
+  // reserve/manage APIs are retained, including non-exclusive arenas and those whose
+  // caller requested an arena ID; there is no public unpin operation. The release includes
+  // an allocator-owned arena's metadata. It needs every thread of the
   // sub-process OUT of the allocator at the same instant: a parked thread is claimable (a
   // MI_OWNER_GATE build parks every thread outside the allocator; otherwise
   // `mi_on_thread_idle_start` is the park), a thread inside a call is not, and its sub-process
@@ -254,7 +256,7 @@ typedef struct mi_purge_all_report_s {
   bool   complete;           // theaps_pending == 0 && theaps_orphaned == 0
   size_t arenas_reclaimed;   // phase F: arenas released to the OS (their metadata included)
   size_t arena_reclaim_bytes;// phase F: the reservation bytes those arenas held
-  size_t arenas_kept;        // phase F: arenas seen completely free and not released -- not ours to give back (see docs/arena-reclaim.md)
+  size_t arenas_kept;        // phase F: completely free arenas retained (e.g. public reserve/manage APIs; see docs/arena-reclaim.md)
   size_t subprocs_pending;   // phase F: sub-processes whose threads could not all be claimed (nothing released there)
   bool   reclaimed;          // phase F: the flag was set and nothing blocked a pass (no pending sub-process, arena layer free)
 } mi_purge_all_report_t;
@@ -500,6 +502,11 @@ mi_decl_export size_t mi_arena_min_alignment(void);
 mi_decl_export size_t mi_arena_min_size(void);
 
 typedef void* mi_arena_id_t;
+// A public reserve/manage call pins its arena against MI_PURGE_RECLAIM for the process
+// lifetime, whether or not arena_id is requested and whether or not it is exclusive.
+// In particular, a returned mi_arena_id_t remains valid after reclaim; there is no
+// public API to release the ID or unpin the arena. Reclaim only releases arenas
+// reserved internally by the allocator.
 mi_decl_export void*  mi_arena_area(mi_arena_id_t arena_id, size_t* size);
 mi_decl_export int    mi_reserve_huge_os_pages_at_ex(size_t pages, int numa_node, size_t timeout_msecs, bool exclusive, mi_arena_id_t* arena_id) mi_attr_noexcept;
 mi_decl_export int    mi_reserve_os_memory_ex(size_t size, bool commit, bool allow_large, bool exclusive, mi_arena_id_t* arena_id) mi_attr_noexcept;
@@ -3330,6 +3337,7 @@ typedef struct mi_arena_s {
   size_t              info_slices;          // initial slices reserved for the arena bitmaps
   int                 numa_node;            // associated NUMA node
   bool                is_exclusive;         // only allow allocations if specifically for this arena
+  bool                is_auto_reserved;     // created by mi_arena_reserve, not a public reserve/manage API
   mi_decl_align(8)                          // needed on some 32-bit platforms
   _Atomic(mi_msecs_t) purge_expire;         // expiration time when slices can be purged from `slices_purge`.
   mi_commit_fun_t*    commit_fun;           // custom commit/decommit memory
@@ -11096,7 +11104,7 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
 }
 
 
-static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool commit, bool allow_large, bool exclusive, mi_arena_id_t* arena_id);
+static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool commit, bool allow_large, bool exclusive, bool auto_reserved, mi_arena_id_t* arena_id);
 
 // try to reserve a fresh arena space
 static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_large, mi_arena_id_t* arena_id)
@@ -11152,7 +11160,7 @@ static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_
   const bool adjust = (overcommit && arena_commit);
   if (adjust) { mi_subproc_stat_adjust_decrease( subproc, committed, arena_reserve); }
   // and try to reserve the arena
-  int err = mi_reserve_os_memory_ex2(subproc, arena_reserve, arena_commit, allow_large, false /* exclusive? */, arena_id);
+  int err = mi_reserve_os_memory_ex2(subproc, arena_reserve, arena_commit, allow_large, false /* exclusive? */, true /* auto_reserved */, arena_id);
   if (err != 0) {
     if (adjust) { mi_subproc_stat_adjust_increase( subproc, committed, arena_reserve); } // roll back
     // failed to allocate: try a smaller size arena as fallback?
@@ -11160,7 +11168,7 @@ static bool mi_arena_reserve(mi_subproc_t* subproc, size_t req_size, bool allow_
     if (arena_reserve > small_arena_reserve && small_arena_reserve > req_size) {
       // try again
       if (adjust) { mi_subproc_stat_adjust_decrease(subproc, committed, small_arena_reserve); }
-      err = mi_reserve_os_memory_ex2(subproc, small_arena_reserve, arena_commit, allow_large, false /* exclusive? */, arena_id);
+      err = mi_reserve_os_memory_ex2(subproc, small_arena_reserve, arena_commit, allow_large, false /* exclusive? */, true /* auto_reserved */, arena_id);
       if (err != 0 && adjust) { mi_subproc_stat_adjust_increase( subproc, committed, small_arena_reserve); } // roll back
     }
   }
@@ -12700,7 +12708,7 @@ void _mi_arena_pages_free(mi_arena_pages_t* arena_pages) {
 
 static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
                                         size_t slice_count, mi_arena_t* parent, size_t total_size,
-                                        int numa_node, bool exclusive,
+                                        int numa_node, bool exclusive, bool auto_reserved,
                                         mi_memid_t memid, mi_commit_fun_t* commit_fun, void* commit_fun_arg, mi_arena_id_t* arena_id)
 {
   mi_assert_internal(_mi_is_aligned(start,MI_ARENA_SLICE_ALIGN));
@@ -12755,6 +12763,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   arena->subproc = subproc;
   arena->memid = memid;
   arena->is_exclusive = exclusive;
+  arena->is_auto_reserved = auto_reserved;
   arena->slice_count = slice_count;
   arena->info_slices = info_slices;
   if (numa_node<0 && mi_option_is_enabled(mi_option_arena_is_numa_local)) {
@@ -12813,7 +12822,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   return arena;
 }
 
-static bool mi_manage_os_memory_ex2(mi_subproc_t* subproc, void* start, size_t size, int numa_node, bool exclusive,
+static bool mi_manage_os_memory_ex2(mi_subproc_t* subproc, void* start, size_t size, int numa_node, bool exclusive, bool auto_reserved,
   mi_memid_t memid, mi_commit_fun_t* commit_fun, void* commit_fun_arg, mi_arena_id_t* arena_id) mi_attr_noexcept
 {
   // checks
@@ -12851,7 +12860,7 @@ static bool mi_manage_os_memory_ex2(mi_subproc_t* subproc, void* start, size_t s
 
     // initialize
     mi_arena_t* arena = mi_arena_initialize( subproc, start, slice_count, parent,
-                                              (parent==NULL ? total_size : 0), numa_node, exclusive,
+                                              (parent==NULL ? total_size : 0), numa_node, exclusive, auto_reserved,
                                               memid, commit_fun, commit_fun_arg,
                                               (parent==NULL ? arena_id : NULL));
     if (arena==NULL) {
@@ -12889,7 +12898,7 @@ bool mi_manage_os_memory_ex(void* start, size_t size, bool is_committed, bool is
   memid.initially_committed = is_committed;
   memid.initially_zero = is_zero;
   memid.is_pinned = is_pinned;
-  return mi_manage_os_memory_ex2(_mi_subproc(), start, size, numa_node, exclusive, memid, NULL, NULL, arena_id);
+  return mi_manage_os_memory_ex2(_mi_subproc(), start, size, numa_node, exclusive, false /* auto_reserved */, memid, NULL, NULL, arena_id);
 }
 
 bool mi_manage_memory(void* start, size_t size, bool is_committed, bool is_pinned, bool is_zero, int numa_node, bool exclusive, mi_commit_fun_t* commit_fun, void* commit_fun_arg, mi_arena_id_t* arena_id) mi_attr_noexcept
@@ -12900,12 +12909,12 @@ bool mi_manage_memory(void* start, size_t size, bool is_committed, bool is_pinne
   memid.initially_committed = is_committed;
   memid.initially_zero = is_zero;
   memid.is_pinned = is_pinned;
-  return mi_manage_os_memory_ex2(_mi_subproc(), start, size, numa_node, exclusive, memid, commit_fun, commit_fun_arg, arena_id);
+  return mi_manage_os_memory_ex2(_mi_subproc(), start, size, numa_node, exclusive, false /* auto_reserved */, memid, commit_fun, commit_fun_arg, arena_id);
 }
 
 
 // Reserve a range of regular OS memory
-static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool commit, bool allow_large, bool exclusive, mi_arena_id_t* arena_id) {
+static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool commit, bool allow_large, bool exclusive, bool auto_reserved, mi_arena_id_t* arena_id) {
   if (arena_id != NULL) *arena_id = _mi_arena_id_none();
   if (size <= MI_MAX_ALLOC_SIZE) {
     size = _mi_align_up(size, MI_ARENA_SLICE_SIZE); // at least one slice
@@ -12917,7 +12926,7 @@ static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool com
   mi_memid_t memid;
   void* start = _mi_os_alloc_aligned(subproc, size, MI_ARENA_SLICE_ALIGN, commit, allow_large, &memid);
   if (start == NULL) return ENOMEM;
-  if (!mi_manage_os_memory_ex2(subproc, start, size, -1 /* numa node */, exclusive, memid, NULL, NULL, arena_id)) {
+  if (!mi_manage_os_memory_ex2(subproc, start, size, -1 /* numa node */, exclusive, auto_reserved, memid, NULL, NULL, arena_id)) {
     _mi_os_free_ex(subproc, start, size, commit, memid);
     _mi_verbose_message("failed to reserve %zu KiB memory\n", _mi_divide_up(size, 1024));
     return ENOMEM;
@@ -12930,7 +12939,7 @@ static int mi_reserve_os_memory_ex2(mi_subproc_t* subproc, size_t size, bool com
 
 // Reserve a range of regular OS memory
 int mi_reserve_os_memory_ex(size_t size, bool commit, bool allow_large, bool exclusive, mi_arena_id_t* arena_id) mi_attr_noexcept {
-  return mi_reserve_os_memory_ex2(_mi_subproc(), size, commit, allow_large, exclusive, arena_id);
+  return mi_reserve_os_memory_ex2(_mi_subproc(), size, commit, allow_large, exclusive, false /* auto_reserved */, arena_id);
 }
 
 // Manage a range of regular OS memory
@@ -13200,7 +13209,7 @@ int mi_reserve_huge_os_pages_at_ex(size_t pages, int numa_node, size_t timeout_m
   }
   _mi_verbose_message("numa node %i: reserved %zu GiB huge pages (of the %zu GiB requested)\n", numa_node, pages_reserved, pages);
 
-  if (!mi_manage_os_memory_ex2(subproc, p, hsize, numa_node, exclusive, memid, NULL, NULL, arena_id)) {
+  if (!mi_manage_os_memory_ex2(subproc, p, hsize, numa_node, exclusive, false /* auto_reserved */, memid, NULL, NULL, arena_id)) {
     _mi_os_free(subproc, p, hsize, memid);
     return ENOMEM;
   }
@@ -27359,11 +27368,9 @@ void mi_purge_all(bool force) mi_attr_noexcept {
        cleaned up in the same call (see `mi_arena_reclaim_release_heap_pages`).
      - The caller's own tld is deliberately NOT claimed: it is the one running this code, and
        its theaps are not swept by anyone while it holds its own gate (the driver enters it).
-     - An arena the application reserved itself (`mi_reserve_os_memory_ex`) and still holds a
-       `mi_arena_id_t` for is NOT distinguishable from one the allocator reserved, unless it was
-       reserved `exclusive` (those are skipped). Retaining an arena id across a reclaim and then
-       using it is a use-after-free; the supported pattern is `exclusive = true` for arenas whose
-       ids outlive the call.
+     - Only arenas marked `is_auto_reserved` by `mi_arena_reserve` are released. Every public
+       reserve/manage API leaves that mark false, including non-exclusive reservations whose
+       `mi_arena_id_t` may still be retained by the caller.
      - `subproc->arena_count` shrinks only when the released arena was the last slot (the same
        CAS the `mi_arena_unload` sketch at the end of src/arena.c -- currently compiled out --
        and `mi_arenas_unsafe_destroy` do), and the subproc's `arena_count` STATISTIC
@@ -27412,18 +27419,19 @@ static bool mi_arena_reclaim_is_empty(mi_arena_t* arena) {
 }
 
 // May we release this arena's memory at all?
-//   - `mi_memkind_is_os`: the arena came from `mi_reserve_os_memory_ex2` (either
-//     `mi_arena_reserve`'s own path or the public `mi_reserve_os_memory_ex`). MI_MEM_EXTERNAL
-//     (`mi_manage_os_memory`) and MI_MEM_STATIC memory belongs to the caller.
+//   - `is_auto_reserved`: only `mi_arena_reserve`'s own path may be released.
+//     Public OS reservations can have retained IDs even when non-exclusive.
+//   - `mi_memkind_is_os`: MI_MEM_EXTERNAL (`mi_manage_os_memory`) and MI_MEM_STATIC
+//     memory belongs to the caller.
 //   - `parent == NULL`: a sub-arena of a managed area (`mi_manage_os_memory_ex2`) is a slice of
 //     the caller's memory too.
 //   - `!is_pinned`: pinned (huge/large-page) memory cannot be handed back per page.
-//   - `!is_exclusive`: an exclusive arena is one whose `mi_arena_id_t` the caller asked for and
-//     may still hold (`mi_reserve_os_memory_ex(..., exclusive=true)`, `mi_heap_new_ex`).
+//   - `!is_exclusive`: belt-and-suspenders for arenas explicitly tied to a caller.
 // This is exactly the set `mi_arenas_unsafe_destroy` frees, plus the `is_exclusive` guard that
 // upstream's `mi_arena_unload` uses for the same reason.
 static bool mi_arena_reclaim_is_ours(mi_arena_t* arena) {
-  return (mi_memkind_is_os(arena->memid.memkind) &&
+  return (arena->is_auto_reserved &&
+          mi_memkind_is_os(arena->memid.memkind) &&
           arena->parent == NULL &&
           !arena->memid.is_pinned &&
           !arena->is_exclusive);
