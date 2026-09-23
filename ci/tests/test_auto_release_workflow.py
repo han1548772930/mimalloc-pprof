@@ -189,12 +189,8 @@ class AutoReleaseStructureTests(unittest.TestCase):
             if step.get("name") == "Determine artifact suffix and release tag"
         )
         tag_script = tag_step["run"]
-        self.assertIn('if [ "$IS_DRY_RUN" = "true" ]; then', tag_script)
-        dry_branch = tag_script.split('if [ "$IS_DRY_RUN" = "true" ]; then', 1)[1].split("else", 1)[
-            0
-        ]
-        self.assertIn("suffix=$(git rev-parse HEAD)", dry_branch)
-        self.assertNotIn("tag=", dry_branch)
+        self.assertIn('echo "suffix=v${version}"', tag_script)
+        self.assertNotIn("git tag", tag_script)
         self.assertIn("steps.tag.outputs.suffix", job_run_text(release))
         self.assertIn(
             "soldr cargo publish --dry-run -p mimalloc-pprof --locked",
@@ -247,7 +243,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 for step in job["steps"]
                 if str(step.get("uses", "")).startswith("actions/checkout")
             )
-            self.assertEqual(checkout["with"]["ref"], "${{ inputs.candidate_sha || github.sha }}")
+            self.assertEqual(checkout["with"]["ref"], "${{ inputs.candidate_sha }}")
         release_checkout = next(
             step
             for step in release["steps"]

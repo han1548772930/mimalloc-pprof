@@ -55,14 +55,18 @@ name: auto-release
 on:
   workflow_dispatch:
     inputs:
+      issue_number:
+        description: "Release attempt issue carrying the immutable directive"
+        required: true
+        type: number
       dry_run:
         description: "Dry run: build, package, and cargo publish --dry-run only; create no tag or release"
         required: false
         type: boolean
         default: true
       candidate_sha:
-        description: "Exact candidate commit SHA (required for a real release)"
-        required: false
+        description: "Exact merged candidate commit SHA"
+        required: true
         type: string
       full_run_id:
         description: "Successful macos-bundles full run ID at candidate_sha (required for a real release)"
@@ -96,6 +100,24 @@ env:
   IS_DRY_RUN: ${{ inputs.dry_run }}
 
 jobs:
+  validate-attempt:
+    name: Validate issue directive and exact candidate SHA
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+      - name: Refuse unrecorded or conflicting release attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: python3 ci/release.py worker-check --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA"
+
   build-and-package:
     name: Build, validate, package (ubuntu-latest)
     # One row, not a matrix. #277's review addendum, item 5: everything this job does --
@@ -105,15 +127,15 @@ jobs:
     # that verified nothing the ubuntu row does not. The binaries are built by
     # `build-binaries` below, on Linux, for every shipped platform.
     runs-on: ubuntu-latest
+    needs: [validate-attempt]
     defaults:
       run:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.candidate_sha || github.sha }}
+          ref: ${{ inputs.candidate_sha }}
       - name: Verify package checkout is the release candidate
-        if: env.IS_DRY_RUN != 'true'
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: |
@@ -123,7 +145,7 @@ jobs:
       # during cache restore (issue #55), which skipped the publish job and turned a
       # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
       # retry action, so attempt it twice explicitly.
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75 # merged #518 audit recovery
         id: setup_soldr
         continue-on-error: true
         with:
@@ -135,7 +157,7 @@ jobs:
 
       - name: Retry toolchain setup (first attempt failed)
         if: steps.setup_soldr.outcome == 'failure'
-        uses: zackees/setup-soldr@v0
+        uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml
@@ -186,6 +208,7 @@ jobs:
   build-binaries:
     name: Cross-build release binaries (${{ matrix.asset }})
     runs-on: ubuntu-latest
+    needs: [validate-attempt]
     strategy:
       fail-fast: false
       matrix:
@@ -205,15 +228,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.candidate_sha || github.sha }}
+          ref: ${{ inputs.candidate_sha }}
       - name: Verify binary checkout is the release candidate
-        if: env.IS_DRY_RUN != 'true'
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: |
           [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" || { echo '::error::binary checkout differs from candidate_sha'; exit 1; }
       - uses: astral-sh/setup-uv@v3
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           # This job drives CMake directly; there is no `soldr cargo` for zccache to wrap.
@@ -431,11 +453,18 @@ jobs:
       actions: read
       contents: write
       id-token: write
+      issues: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.candidate_sha || github.sha }}
+          ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0 # origin/main is needed to prove a real candidate was merged
+
+      - name: Verify release checkout is the candidate even in a dry run
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" || { echo '::error::release checkout differs from candidate_sha'; exit 1; }
 
       - name: Require exact-SHA full native macOS evidence before any release write
         if: env.IS_DRY_RUN != 'true'
@@ -506,7 +535,7 @@ jobs:
       # during cache restore (issue #55), which skipped the publish job and turned a
       # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
       # retry action, so attempt it twice explicitly.
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
         id: setup_soldr
         continue-on-error: true
         with:
@@ -518,7 +547,7 @@ jobs:
 
       - name: Retry toolchain setup (first attempt failed)
         if: steps.setup_soldr.outcome == 'failure'
-        uses: zackees/setup-soldr@v0
+        uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml
@@ -545,15 +574,9 @@ jobs:
         id: tag
         shell: bash
         run: |
-          if [ "$IS_DRY_RUN" = "true" ]; then
-            # A dry run names its local assets with the exact candidate SHA.
-            # It does not create or name a Git tag.
-            echo "suffix=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          else
-            candidate=$(git rev-parse HEAD)
-            echo "tag=manual-${candidate::7}" >> "$GITHUB_OUTPUT"
-            echo "suffix=manual-${candidate::7}" >> "$GITHUB_OUTPUT"
-          fi
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("rust/mimalloc-pprof/Cargo.toml", "rb"))["package"]["version"])')
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+          echo "suffix=v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Rename assets to versioned artifact names, and require all five
         # Five, counted: the architecture-independent C amalgamation ZIP plus one archive
@@ -582,6 +605,20 @@ jobs:
             exit 1
           fi
           ls -l dist
+
+      - name: Collate exact asset hashes and release-level info.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: python3 ci/release.py preflight-artifacts --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" --dist dist
+
+      - name: Upload release preflight record
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-preflight-${{ inputs.candidate_sha }}
+          path: dist/
+          if-no-files-found: error
 
       - name: Authenticate with crates.io
         if: env.IS_DRY_RUN != 'true'
@@ -669,3 +706,37 @@ jobs:
           fi
           echo "::error::Candidate ${{ inputs.candidate_sha }} was NOT released (build=${build}, binaries=${binaries}, release=${release}). Check destination state before retrying run ${GITHUB_RUN_ID}."
           exit 1
+
+  record-attempt-outcome:
+    name: Record release attempt outcome on issue
+    needs: [validate-attempt, build-and-package, build-binaries, release]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+      - name: Append run URL and outcome to the release control issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          VALIDATE: ${{ needs.validate-attempt.result }}
+          PACKAGE: ${{ needs.build-and-package.result }}
+          BINARIES: ${{ needs.build-binaries.result }}
+          RELEASE: ${{ needs.release.result }}
+          IS_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          state=blocked
+          if [[ "$VALIDATE" == success && "$PACKAGE" == success && "$BINARIES" == success && "$RELEASE" == success ]]; then
+            if [[ "$IS_DRY_RUN" == true ]]; then state=dry-passed; else state=real-passed; fi
+          fi
+          results="validate=$VALIDATE,package=$PACKAGE,binaries=$BINARIES,release=$RELEASE"
+          python3 ci/release.py record-outcome --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --state "$state" --results "$results"
+          [[ "$state" != blocked ]]
