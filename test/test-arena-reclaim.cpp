@@ -410,11 +410,37 @@ static void run_heap_reuse_row(void) {
   mi_free(keep);
 }
 
+// A non-exclusive public reservation is still caller-owned when its ID is returned.
+// This row is deliberately a separate process: a buggy reclaim unmaps the arena,
+// and mi_arena_area(id) then faults under ASan/Windows instead of reporting a failure.
+static void run_retained_id_row(void) {
+  printf("[A8] a retained ID for a non-exclusive public reservation survives reclaim\n");
+  mi_arena_id_t id = NULL;
+  const int rc = mi_reserve_os_memory_ex(64 * 1024 * 1024, false, false, false, &id);
+  check(rc == 0 && id != NULL, "A8: the public reservation returned an arena ID");
+  if (rc != 0 || id == NULL) return;
+  size_t size_before = 0;
+  void* const area_before = mi_arena_area(id, &size_before);
+  check(area_before != NULL && size_before >= 64 * 1024 * 1024,
+        "A8: the retained ID names its original reservation");
+  mi_purge_all_report_t rep; _mi_memzero(&rep, sizeof(rep));
+  (void)mi_purge_all_ex((mi_purge_flags_t)(MI_PURGE_FORCE | MI_PURGE_RECLAIM), 100, &rep);
+  check(rep.reclaimed && rep.arenas_kept >= 1,
+        "A8: reclaim ran but kept the caller-reserved empty arena");
+  size_t size_after = 0;
+  void* const area_after = mi_arena_area(id, &size_after);
+  check(area_after == area_before && size_after == size_before,
+        "A8: the retained arena ID remains valid after reclaim");
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);   // a hang must show which row it hangs in (ctest kills on TIMEOUT)
   printf("mimalloc-pprof: free-arena reclaim, MI_OWNER_GATE=%d MI_DEBUG=%d\n", (int)MI_OWNER_GATE, (int)MI_DEBUG);
   if (argc == 2 && strcmp(argv[1], "--heap-reuse") == 0) {
     run_heap_reuse_row();
+  }
+  else if (argc == 2 && strcmp(argv[1], "--retained-id") == 0) {
+    run_retained_id_row();
   }
   else {
     run_reclaim_rows();
