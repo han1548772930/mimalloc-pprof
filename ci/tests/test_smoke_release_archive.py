@@ -9,11 +9,24 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from typing import TypedDict
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from release import ReleaseError
 from smoke_release_archive import verify_and_smoke
+
+
+class _ArchiveArtifact(TypedDict):
+    name: str
+    bytes: int
+    sha256: str
+    validated: dict[str, str]
+
+
+class _ArchiveInfo(TypedDict):
+    candidate_sha: str
+    artifacts: list[_ArchiveArtifact]
 
 
 class SmokeArchiveTests(unittest.TestCase):
@@ -28,7 +41,7 @@ class SmokeArchiveTests(unittest.TestCase):
             archive.writestr("bin/mimalloc.dll", self.binary)
             archive.writestr("bin/libgcc_s_seh-1.dll", b"runtime")
         raw = (self.dist / self.name).read_bytes()
-        self.info = {
+        self.info: _ArchiveInfo = {
             "candidate_sha": self.sha,
             "artifacts": [
                 {
