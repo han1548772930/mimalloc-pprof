@@ -48,10 +48,8 @@ Two additional gates must be closed before the real publisher is enabled:
   and has the requested version. It must also prove that this SHA is the
   intended, reviewed version-bump merge commit recorded by the release issue;
   an arbitrary older main commit with the same version is insufficient.
-- `info.json` currently proves the five outer archive names, sizes, and hashes.
-  The release preflight must inspect each archive's internal target identity and
-  provenance, then prove that the shipped bytes are the same bytes exercised by
-  the exact-SHA full test bundles. A matching filename alone is insufficient.
+- The remaining release state machine must preserve each archive's validated
+  identity and hashes across retries, and verify final registry destinations.
 
 The archive inspection gate now checks the C ZIP against candidate vendor files,
 checks binary archive `PROVENANCE.txt` commit/target fields, and checks the
@@ -61,7 +59,7 @@ full test jobs executed the same library bytes: `auto-release.yml` builds its
 installable assets in separate jobs from `macos-bundles.yml` and
 `windows-bundles.yml`, whose test bundles are built again.
 
-The dry-run worker now also downloads its preflight artifact in four native
+The dry-run worker also downloads its preflight artifact in four native
 `smoke-shipped-assets` jobs (hosted Intel Mac, Apple Silicon Mac, and two Windows
 DLL lanes). Each job checks the exact candidate checkout, compares the outer
 archive and the packaged library's SHA-256 with `info.json`, then calls
@@ -69,26 +67,15 @@ archive and the packaged library's SHA-256 with `info.json`, then calls
 smoke, not the full suite, and the real publication path remains fail-closed.
 The control issue records `dry-passed` only after all four native smoke rows
 succeed; its outcome includes the matrix result.
-The smoke currently follows the dry-run preflight upload; before enabling real
-publication, it must become a required predecessor of every write.
+The allocation smoke follows the dry-run preflight upload. The stronger
+release-local C suite is already a predecessor of every publication step.
 
-Hash-matching the full macOS/Windows test bundle library to these archives is
-not possible with the current build settings. The release build enables
-`MI_PPROF`, `MI_MEMEVT`, and `MI_DIAGNOSTICS` with `MI_BUILD_TESTS=OFF`; full
-test bundle configurations also enable `MI_DHAT` or select other feature sets,
-and are separately configured and linked. The resulting library bytes are not
-expected to match even at the same source SHA and toolchain. Publication must
-stay disabled until a matching installable library is included in the native
-test execution artifact or the release archives are derived from exactly those
-executed bytes, with hashes verified against the recorded full-run artifacts.
-
-Before publication, make each release archive derive from the exact Linux-built
-Release bundle artifact that the native target runner downloaded and executed,
-or include the installable library in that test bundle and make the release
-worker compare its SHA-256 with the archive member. Pin both downloads to the
-recorded successful full run IDs and candidate SHA; do not select artifacts by
-name across runs. The worker should fail if a run is missing, unsuccessful, or
-its extracted library hash differs, and record the run ID and matching library
-hash per target in `info.json`. The C source ZIP needs a separate candidate-tree
-comparison as implemented above. This flow needs an end-to-end dry run before
-the publisher gate can be opened.
+The release worker now builds its C test executables in the same tree as the
+installed product libraries, with `MI_DHAT=OFF` retained. A release-local native
+matrix compares the installed shared and static library bytes with the test
+bundle's copies, then runs the bundle's C suite on hosted macOS Intel/ARM and
+Windows GNU/MSVC. This matrix is a predecessor of `release`, so a failed or
+missing native row prevents every publication step. The older full CI bundles
+still exercise their own configurations, including DHAT, and are not claimed
+to have byte-identical libraries. The real publisher stays behind the explicit
+failing fleet gate until the remaining release state machine is implemented.

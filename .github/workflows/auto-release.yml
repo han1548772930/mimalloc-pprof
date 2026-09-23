@@ -19,10 +19,9 @@ name: auto-release
 #      Shipping a natively-built binary while testing a cross-built one would mean the
 #      thing under test and the thing shipped are different binaries.
 #
-# So: the same `soldr prepare` toolchains, the same `cmake/toolchains/soldr-<triple>.cmake`
-# toolchain files and the same commit that produce the test bundles executed by
-# `macos-bundles.yml` and `windows-bundles.yml` also produce these assets. The bundles are
-# the evidence for the assets.
+# The release build uses the same cross toolchains as the full CI bundles, but a distinct
+# product configuration. Its own test bundle is built in the same tree as the installed
+# libraries; native release jobs compare the bytes and execute that bundle.
 #
 # What that costs, stated rather than hidden:
 #   - macOS assets are built by soldr's clang 21 against soldr's Apple SDK, NOT by Xcode's
@@ -200,11 +199,9 @@ jobs:
   # header for why none of them runs on the platform it targets, and docs/ci-gates.md
   # ("Release assets are cross-built") for the same decision written out at length.
   #
-  # These use the SAME toolchain files and the SAME `soldr prepare` targets as
-  # macos-bundles.yml and windows-bundles.yml, so the binary a release ships is produced
-  # by the toolchain whose output those workflows actually execute. Locally reproducible
-  # with `uv run ci/verify_local.py --bundle <lane>-release` (#277 phase F), which builds
-  # the test bundle from the same configure line plus MI_BUILD_TESTS.
+  # These use the same toolchain files and `soldr prepare` targets as full CI. The
+  # product flags differ (notably MI_DHAT=OFF), so release-local native tests below
+  # execute a bundle built alongside the installed library bytes.
   build-binaries:
     name: Cross-build release binaries (${{ matrix.asset }})
     runs-on: ubuntu-latest
@@ -265,8 +262,8 @@ jobs:
           fi
           soldr prepare "${args[@]}"
       - name: Configure, build and install
-        # MI_BUILD_TESTS=OFF is the only difference from the bundle lanes' Release
-        # configure line: a release asset ships the library, not 35 test executables.
+        # Build test executables in the very same tree as the installed product libraries.
+        # The product keeps DHAT disabled; full CI's DHAT-enabled bundles are separate.
         # The install rules carry this fork's own headers (include/mimalloc/profile.h and
         # memory-events.h) as well as upstream's, plus the pkg-config and CMake package
         # files and, on Windows, mimalloc-redirect.dll -- verified on all four lanes.
@@ -277,7 +274,7 @@ jobs:
           # heap snapshot / live-heap dump) rather than inheriting them from a default.
           # DHAT and the owner gate stay out, exactly as before.
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DMI_BUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DMI_DHAT=OFF -DMI_BUILD_TESTS=ON \
             --toolchain cmake/toolchains/soldr-${{ matrix.triple }}.cmake \
             --log-level=VERBOSE 2>&1 | tee configure.log
           # Assert on the RESOLVED library list, not on the option that was passed in --
@@ -295,6 +292,27 @@ jobs:
           fi
           cmake --build build --parallel
           cmake --install build --prefix "$PWD/stage"
+      - name: Bundle release-tree tests
+        run: |
+          set -euo pipefail
+          case '${{ matrix.triple }}' in
+            x86_64-pc-windows-gnu)
+              uv run ci/bundle_tests.py build release-test-bundle \
+                --objdump "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump" \
+                --dll-search-dir "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib"
+              ;;
+            x86_64-pc-windows-msvc)
+              uv run ci/bundle_tests.py build release-test-bundle \
+                --objdump llvm-objdump --check-dll-closure --allow-msvc-runtime
+              ;;
+            *) uv run ci/bundle_tests.py build release-test-bundle ;;
+          esac
+          tar -C release-test-bundle -czf release-test-bundle.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-test-bundle-${{ matrix.asset }}
+          path: release-test-bundle.tar.gz
+          if-no-files-found: error
       - name: Ship the toolchain runtime DLLs, and prove the import closure resolves
         # windows-gnu only in effect: soldr's mingw-w64 links mimalloc.dll against
         # libgcc_s_seh-1.dll (for __popcountdi2), which a plain Windows machine does not
@@ -385,13 +403,14 @@ jobs:
             echo "commit:   $(git rev-parse HEAD)"
             echo "target:   ${TRIPLE}"
             echo "built on: ubuntu-latest (Linux), cross-compiled through soldr $(soldr --version 2>/dev/null || echo '?')"
-            echo "config:   -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_TESTS=OFF"
+            echo "config:   -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MEMEVT=ON"
+            echo "          -DMI_DIAGNOSTICS=ON -DMI_DHAT=OFF -DMI_BUILD_TESTS=ON"
             echo
             echo "This binary was NOT built on the platform it targets. Every mimalloc-pprof"
             echo "release asset is cross-compiled on Linux, deliberately: mimalloc-pprof ships"
             echo "inside cross-compiled code, so the cross-built artifact is the product, and"
-            echo "it is the artifact this project's CI actually executes its test suite from"
-            echo "(.github/workflows/macos-bundles.yml, windows-bundles.yml)."
+            echo "The release test bundle is built in this same tree. Native release jobs"
+            echo "compare its libraries with this archive and execute its C tests."
             echo
             case "${TRIPLE}" in
               *-apple-darwin)
@@ -442,12 +461,66 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  test-shipped-assets:
+    name: Test packaged library (${{ matrix.asset }})
+    needs: [build-binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: macos-arm64
+            runner: macos-15
+            extension: tar.gz
+          - asset: macos-x86_64
+            runner: macos-15-intel
+            extension: tar.gz
+          - asset: windows-x64-gnu
+            runner: windows-latest
+            extension: zip
+          - asset: windows-x64-msvc
+            runner: windows-latest
+            extension: zip
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries-${{ matrix.asset }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-test-bundle-${{ matrix.asset }}
+          path: test-input
+      - name: Verify packaged bytes and execute the release-configuration C suite
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          ASSET: ${{ matrix.asset }}
+          EXTENSION: ${{ matrix.extension }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          archive="dist/mimalloc-pprof-${ASSET}.${EXTENSION}"
+          bundle=test-input/release-test-bundle.tar.gz
+          python3 ci/verify_release_test_bundle.py --archive "$archive" --bundle "$bundle" --asset "$ASSET"
+          mkdir -p release-test-bundle
+          tar -C release-test-bundle -xzf "$bundle"
+          python3 ci/run_test_bundle.py release-test-bundle
+
   release:
     name: Create GitHub Release + publish to crates.io
     # build-binaries is a hard dependency, not a best-effort extra: a release that
     # published to crates.io and then shipped three of its four platform archives would be
     # a release nobody can tell is incomplete. `release-outcome` says so out loud too.
-    needs: [build-and-package, build-binaries]
+    needs: [build-and-package, build-binaries, test-shipped-assets]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -753,7 +826,7 @@ jobs:
 
   record-attempt-outcome:
     name: Record release attempt outcome on issue
-    needs: [validate-attempt, build-and-package, build-binaries, release, smoke-shipped-assets]
+    needs: [validate-attempt, build-and-package, build-binaries, test-shipped-assets, release, smoke-shipped-assets]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -771,20 +844,21 @@ jobs:
           VALIDATE: ${{ needs.validate-attempt.result }}
           PACKAGE: ${{ needs.build-and-package.result }}
           BINARIES: ${{ needs.build-binaries.result }}
+          TEST_SHIPPED: ${{ needs.test-shipped-assets.result }}
           RELEASE: ${{ needs.release.result }}
           SMOKE: ${{ needs.smoke-shipped-assets.result }}
           IS_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           state=blocked
-          if [[ "$VALIDATE" == success && "$PACKAGE" == success && "$BINARIES" == success && "$RELEASE" == success ]]; then
+          if [[ "$VALIDATE" == success && "$PACKAGE" == success && "$BINARIES" == success && "$TEST_SHIPPED" == success && "$RELEASE" == success ]]; then
             if [[ "$IS_DRY_RUN" == true && "$SMOKE" == success ]]; then
               state=dry-passed
             elif [[ "$IS_DRY_RUN" != true ]]; then
               state=real-passed
             fi
           fi
-          results="validate=$VALIDATE,package=$PACKAGE,binaries=$BINARIES,release=$RELEASE,smoke=$SMOKE"
+          results="validate=$VALIDATE,package=$PACKAGE,binaries=$BINARIES,test-shipped=$TEST_SHIPPED,release=$RELEASE,smoke=$SMOKE"
           python3 ci/release.py record-outcome --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" \
             --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --state "$state" --results "$results"

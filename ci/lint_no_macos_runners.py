@@ -117,6 +117,25 @@ def offenders(document: object) -> Iterator[tuple[str, str]]:
 
 def allowed_full_runner(file: Path, document: object, path: str, label: str) -> bool:
     """The only owner-approved hosted Mac exception: both arches in one opt-in job."""
+    if file.name == "auto-release.yml" and path == "jobs.test-shipped-assets.strategy.matrix":
+        jobs = cast("dict[str, object]", cast("dict[str, object]", document).get("jobs", {}))
+        job = cast("dict[str, object]", jobs.get("test-shipped-assets", {}))
+        matrix = cast(
+            "dict[str, object]",
+            cast("dict[str, object]", job.get("strategy", {})).get("matrix", {}),
+        )
+        return (
+            label in {"macos-15", "macos-15-intel"}
+            and job.get("runs-on") == "${{ matrix.runner }}"
+            and job.get("needs") == ["build-binaries"]
+            and matrix.get("include")
+            == [
+                {"asset": "macos-arm64", "runner": "macos-15", "extension": "tar.gz"},
+                {"asset": "macos-x86_64", "runner": "macos-15-intel", "extension": "tar.gz"},
+                {"asset": "windows-x64-gnu", "runner": "windows-latest", "extension": "zip"},
+                {"asset": "windows-x64-msvc", "runner": "windows-latest", "extension": "zip"},
+            ]
+        )
     if file.name == "auto-release.yml" and path == "jobs.smoke-shipped-assets.strategy.matrix":
         jobs = cast("dict[str, object]", cast("dict[str, object]", document).get("jobs", {}))
         job = cast("dict[str, object]", jobs.get("smoke-shipped-assets", {}))

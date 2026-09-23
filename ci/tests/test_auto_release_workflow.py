@@ -6,11 +6,9 @@ failure once already. These tests are the substitute for a CI run: they assert t
 the workflow has to have, from the YAML itself.
 
 What they check:
-  * no non-Linux runner anywhere (the owner requirement that macOS never runs natively is
-    enforced repository-wide by ci/lint_no_macos_runners.py; this adds "and nothing here
-    runs on Windows either, because every shipped binary is cross-built");
+  * build and publication stay on Linux; the release-local test gate runs on native hosts;
   * `release` waits for every job that produces one of its assets;
-  * every artifact a build job uploads is actually downloaded by `release`;
+  * shipped artifacts are downloaded by `release`; test bundles by the native gate;
   * the release's `files:` list, the rename step and the build matrix all name the same
     set of assets -- three places that have to agree and no compiler to check them;
   * every cross lane names a toolchain file that exists.
@@ -65,7 +63,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
 
     def test_build_and_publication_jobs_run_on_linux(self) -> None:
         for name, job in self.jobs().items():
-            if name == "smoke-shipped-assets":
+            if name in ("smoke-shipped-assets", "test-shipped-assets"):
                 continue
             runs_on = job.get("runs-on")
             self.assertEqual(
@@ -89,6 +87,33 @@ class AutoReleaseStructureTests(unittest.TestCase):
         self.assertIsInstance(needs, list)
         self.assertIn("build-and-package", needs)
         self.assertIn("build-binaries", needs)
+        self.assertIn("test-shipped-assets", needs)
+
+    def test_release_test_gate_uses_all_native_hosts_and_exact_bytes(self) -> None:
+        gate = self.jobs()["test-shipped-assets"]
+        self.assertEqual(gate["needs"], ["build-binaries"])
+        self.assertEqual(gate["runs-on"], "${{ matrix.runner }}")
+        self.assertEqual(
+            {row["asset"]: row["runner"] for row in gate["strategy"]["matrix"]["include"]},
+            {
+                "macos-arm64": "macos-15",
+                "macos-x86_64": "macos-15-intel",
+                "windows-x64-gnu": "windows-latest",
+                "windows-x64-msvc": "windows-latest",
+            },
+        )
+        script = job_run_text(gate)
+        self.assertIn("ci/verify_release_test_bundle.py", script)
+        self.assertIn("ci/run_test_bundle.py", script)
+        downloads = [
+            step["with"]["name"]
+            for step in gate["steps"]
+            if str(step.get("uses", "")).startswith("actions/download-artifact")
+        ]
+        self.assertEqual(
+            downloads,
+            ["release-binaries-${{ matrix.asset }}", "release-test-bundle-${{ matrix.asset }}"],
+        )
 
     def test_release_outcome_reports_every_build_job(self) -> None:
         outcome = self.jobs()["release-outcome"]
@@ -128,7 +153,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 if "pattern" in with_:
                     patterns.append(str(with_["pattern"]))
         for artifact in uploaded:
-            if artifact.startswith("release-preflight-"):
+            if artifact.startswith(("release-preflight-", "release-test-bundle-")):
                 continue
             covered = artifact in downloaded or any(
                 artifact.startswith(pattern.rstrip("*")) for pattern in patterns
@@ -163,10 +188,13 @@ class AutoReleaseStructureTests(unittest.TestCase):
     def test_recorded_dry_success_waits_for_native_smoke(self) -> None:
         record = self.jobs()["record-attempt-outcome"]
         self.assertIn("smoke-shipped-assets", record["needs"])
+        self.assertIn("test-shipped-assets", record["needs"])
         step = next(step for step in record["steps"] if "record-outcome" in step.get("run", ""))
         self.assertEqual(step["env"]["SMOKE"], "${{ needs.smoke-shipped-assets.result }}")
+        self.assertEqual(step["env"]["TEST_SHIPPED"], "${{ needs.test-shipped-assets.result }}")
         script = step["run"]
         self.assertIn('"$SMOKE" == success', script)
+        self.assertIn('"$TEST_SHIPPED" == success', script)
         self.assertIn("smoke=$SMOKE", script)
         self.assertIn("state=dry-passed", script)
         self.assertIn("state=real-passed", script)
