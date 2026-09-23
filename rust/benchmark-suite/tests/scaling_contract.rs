@@ -12,6 +12,7 @@ use benchmark_suite::scaling::{
     ScalingPattern, ScalingRawRun, WorkerPlanner, SCALING_BLOCKS, SCALING_CHILD_PROTOCOL_VERSION,
     SCALING_PATTERNS, SCALING_RIGOR_LABEL, SCALING_SCHEMA_VERSION, SCALING_THREAD_POINTS,
 };
+use benchmark_suite::scaling::{merge_scaling_runs, scaling_thread_points_for_shard};
 
 /// Leak-detecting mock allocator. `Drop` asserts every block was released, so
 /// any oracle/executor drift shows up as a failure rather than a leak.
@@ -354,6 +355,76 @@ fn sample_run() -> ScalingRawRun {
         .expect("synthetic scaling fixture builds");
     let text = serde_json::to_string(&raw).expect("scaling fixture serializes");
     serde_json::from_str(&text).expect("scaling fixture parses")
+}
+
+fn split_fixture(raw: &ScalingRawRun, shard_count: usize) -> Vec<ScalingRawRun> {
+    (0..shard_count)
+        .map(|shard_index| {
+            let threads = scaling_thread_points_for_shard(shard_index, shard_count).unwrap();
+            let mut shard = raw.clone();
+            shard.status = "incomplete".into();
+            shard
+                .calibrations
+                .retain(|value| threads.contains(&value.thread_count));
+            shard
+                .samples
+                .retain(|value| threads.contains(&value.thread_count));
+            shard.run.generated_at_utc = format!("2026-08-13T00:00:0{shard_index}Z");
+            shard
+        })
+        .collect()
+}
+
+#[test]
+fn scaling_shards_are_deterministic_and_cover_the_matrix_once() {
+    let assigned = (0..SCALING_THREAD_POINTS.len())
+        .flat_map(|index| scaling_thread_points_for_shard(index, 6).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(assigned, SCALING_THREAD_POINTS);
+    assert_eq!(scaling_thread_points_for_shard(2, 6).unwrap(), vec![3]);
+    assert!(scaling_thread_points_for_shard(0, 0).is_err());
+    assert!(scaling_thread_points_for_shard(6, 6).is_err());
+}
+
+#[test]
+fn scaling_shards_merge_to_a_complete_valid_run() {
+    let raw = sample_run();
+    let merged = merge_scaling_runs(split_fixture(&raw, 6)).unwrap();
+    validate_scaling_raw_run(&merged).unwrap();
+    assert_eq!(merged.run.generated_at_utc, raw.run.generated_at_utc);
+    assert_eq!(merged.calibrations.len(), raw.calibrations.len());
+    assert_eq!(merged.samples.len(), raw.samples.len());
+}
+
+#[test]
+fn scaling_merge_rejects_mismatch_missing_and_overlap() {
+    let raw = sample_run();
+
+    let mut shards = split_fixture(&raw, 6);
+    shards[1].run_seed ^= 1;
+    assert!(merge_scaling_runs(shards).unwrap_err().contains("run seed"));
+
+    let mut shards = split_fixture(&raw, 6);
+    shards[1].runner.cpu_model.push_str("-different");
+    assert!(merge_scaling_runs(shards).unwrap_err().contains("runner"));
+
+    let mut shards = split_fixture(&raw, 6);
+    shards[1].topology.logical_cores += 1;
+    assert!(merge_scaling_runs(shards).unwrap_err().contains("topology"));
+
+    let mut shards = split_fixture(&raw, 6);
+    shards[1].allocators[0].compiler.push_str("-different");
+    assert!(merge_scaling_runs(shards)
+        .unwrap_err()
+        .contains("allocator identities"));
+
+    let mut shards = split_fixture(&raw, 6);
+    shards.pop();
+    assert!(merge_scaling_runs(shards).is_err());
+
+    let mut shards = split_fixture(&raw, 6);
+    shards.push(shards[0].clone());
+    assert!(merge_scaling_runs(shards).unwrap_err().contains("overlap"));
 }
 
 #[test]

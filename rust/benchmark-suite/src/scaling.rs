@@ -57,6 +57,23 @@ pub const DISTRIBUTION_BLOCKS: u32 = 40;
 /// thread points are part of the metric comparison key, so changing them
 /// starts a new history lineage instead of rewriting the sparse one.
 pub const SCALING_THREAD_POINTS: [u32; 6] = [1, 2, 3, 4, 6, 8];
+
+pub fn scaling_thread_points_for_shard(
+    shard_index: usize,
+    shard_count: usize,
+) -> Result<Vec<u32>, String> {
+    if shard_count == 0 {
+        return Err("--shard-count must be at least 1".into());
+    }
+    if shard_index >= shard_count {
+        return Err("--shard-index must be less than --shard-count".into());
+    }
+    Ok(SCALING_THREAD_POINTS
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, threads)| (index % shard_count == shard_index).then_some(threads))
+        .collect())
+}
 /// External RSS sampling cadence while a scaling child runs.
 pub const SCALING_RSS_POLL_INTERVAL_NS: u64 = 5_000_000;
 pub const SCALING_RIGOR_LABEL: &str =
@@ -2056,6 +2073,95 @@ pub struct ScalingRawRun {
     pub allocators: Vec<AllocatorBuildIdentity>,
     pub calibrations: Vec<ScalingCalibration>,
     pub samples: Vec<ScalingRawSample>,
+}
+
+pub fn merge_scaling_runs(mut shards: Vec<ScalingRawRun>) -> Result<ScalingRawRun, String> {
+    if shards.is_empty() {
+        return Err("at least one scaling shard is required".into());
+    }
+    let mut merged = shards.remove(0);
+    merged.status = "incomplete".into();
+    for shard in shards {
+        if shard.metric_schema_version != merged.metric_schema_version {
+            return Err("scaling shards have different metric schema versions".into());
+        }
+        if shard.run_seed != merged.run_seed {
+            return Err("scaling shards have different run seeds".into());
+        }
+        if shard.allocator_lock_sha256 != merged.allocator_lock_sha256 {
+            return Err("scaling shards have different allocator lock digests".into());
+        }
+        if shard.allocators != merged.allocators {
+            return Err("scaling shards have different allocator identities".into());
+        }
+        if shard.topology != merged.topology {
+            return Err("scaling shards have different topology".into());
+        }
+        if shard.runner != merged.runner {
+            return Err("scaling shards have different runner identities".into());
+        }
+        let left_run = merged.run.clone();
+        let mut right_run = shard.run.clone();
+        right_run.generated_at_utc = left_run.generated_at_utc.clone();
+        if left_run != right_run {
+            return Err("scaling shards have different run identities".into());
+        }
+        let occupied = merged
+            .calibrations
+            .iter()
+            .map(|value| (value.pattern.as_str(), value.thread_count))
+            .collect::<BTreeSet<_>>();
+        if shard
+            .calibrations
+            .iter()
+            .any(|value| occupied.contains(&(value.pattern.as_str(), value.thread_count)))
+        {
+            return Err("scaling shards overlap on a matrix cell".into());
+        }
+        merged.calibrations.extend(shard.calibrations);
+        merged.samples.extend(shard.samples);
+    }
+    merged
+        .calibrations
+        .sort_by_key(|value| (value.pattern.clone(), value.thread_count));
+    merged.samples.sort_by_key(|value| {
+        (
+            value.pattern.clone(),
+            value.thread_count,
+            value.block_id,
+            value.ordinal,
+            value.allocator_id.clone(),
+        )
+    });
+
+    let expected_cells = SCALING_PATTERNS.len() * SCALING_THREAD_POINTS.len();
+    if merged.calibrations.len() != expected_cells {
+        return Err(format!(
+            "merged scaling matrix is missing cells: got {}, expected {expected_cells}",
+            merged.calibrations.len()
+        ));
+    }
+    let complete = SCALING_PATTERNS.into_iter().all(|pattern| {
+        SCALING_THREAD_POINTS.into_iter().all(|threads| {
+            ALLOCATOR_IDS.into_iter().all(|allocator| {
+                merged
+                    .samples
+                    .iter()
+                    .filter(|sample| {
+                        sample.pattern == pattern.as_str()
+                            && sample.thread_count == threads
+                            && sample.allocator_id == allocator
+                    })
+                    .count()
+                    == pattern.full_blocks() as usize
+            })
+        })
+    });
+    merged.status = if complete { "complete" } else { "incomplete" }.into();
+    if complete {
+        validate_scaling_raw_run(&merged)?;
+    }
+    Ok(merged)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
