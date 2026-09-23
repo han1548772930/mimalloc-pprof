@@ -1077,6 +1077,26 @@ static mi_page_t* mi_arenas_page_singleton_alloc(mi_theap_t* theap, size_t block
   return page;
 }
 
+// This runs only before allocating a fresh regular large page. It uses queue
+// history to separate sparse low-churn queues from hot queues that benefit from
+// the default 4 MiB geometry. Existing pages are never resized.
+static size_t mi_dynamic_large_page_size(mi_theap_t* theap, size_t block_size) {
+  // Compacting spans trades fewer resident holes for more page/span churn. Keep
+  // the original geometry for low-concurrency heaps; aggregate pressure from a
+  // real worker pool is where the resident-space win pays for that trade.
+  if (theap->tld == NULL || theap->tld->subproc == NULL ||
+      mi_atomic_load_relaxed(&theap->tld->subproc->thread_count) < 4) {
+    return MI_LARGE_PAGE_SIZE;
+  }
+  // Exact power-of-two classes are the hot reuse path in the scaling suite;
+  // keep their original span size even when other classes compact.
+  if (_mi_is_power_of_two(block_size)) return MI_LARGE_PAGE_SIZE;
+  // Irregular classes use 1 MiB spans under sustained worker pressure. Exact
+  // power-of-two classes above remain on the 4 MiB reuse path.
+  MI_UNUSED(block_size);
+  return MI_ARENA_SLICE_SIZE * 16;
+}
+
 
 mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t block_alignment) {
   mi_page_t* page;
@@ -1094,7 +1114,8 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
   }
   #if MI_ENABLE_LARGE_PAGES
   else if (block_size <= MI_LARGE_MAX_OBJ_SIZE) {
-    page = mi_arenas_page_regular_alloc(theap, mi_slice_count_of_size(MI_LARGE_PAGE_SIZE), block_size);
+    const size_t page_size = mi_dynamic_large_page_size(theap, block_size);
+    page = mi_arenas_page_regular_alloc(theap, mi_slice_count_of_size(page_size), block_size);
   }
   #endif
   else {
