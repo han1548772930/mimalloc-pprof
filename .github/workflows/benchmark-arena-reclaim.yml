@@ -4,10 +4,6 @@ name: benchmark-arena-reclaim
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - 'ci/bench_arena_reclaim.*'
-      - '.github/workflows/benchmark-arena-reclaim.yml'
 
 permissions:
   contents: read
