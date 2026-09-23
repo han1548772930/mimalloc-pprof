@@ -160,6 +160,21 @@ class AutoReleaseStructureTests(unittest.TestCase):
         self.assertIn("ci/smoke_release_archive.py", steps[3]["run"])
         self.assertIn('--asset "$ASSET"', steps[3]["run"])
 
+    def test_recorded_dry_success_waits_for_native_smoke(self) -> None:
+        record = self.jobs()["record-attempt-outcome"]
+        self.assertIn("smoke-shipped-assets", record["needs"])
+        step = next(step for step in record["steps"] if "record-outcome" in step.get("run", ""))
+        self.assertEqual(step["env"]["SMOKE"], "${{ needs.smoke-shipped-assets.result }}")
+        script = step["run"]
+        self.assertIn('"$SMOKE" == success', script)
+        self.assertIn("smoke=$SMOKE", script)
+        self.assertIn("state=dry-passed", script)
+        self.assertIn("state=real-passed", script)
+        self.assertEqual(
+            self.jobs()["release-outcome"]["needs"],
+            ["build-and-package", "build-binaries", "release"],
+        )
+
     def test_release_files_rename_and_matrix_agree(self) -> None:
         release = self.jobs()["release"]
         gh_release = next(

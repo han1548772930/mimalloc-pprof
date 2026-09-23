@@ -67,6 +67,8 @@ DLL lanes). Each job checks the exact candidate checkout, compares the outer
 archive and the packaged library's SHA-256 with `info.json`, then calls
 `mi_malloc` and `mi_free` through that packaged library. This is an allocation
 smoke, not the full suite, and the real publication path remains fail-closed.
+The control issue records `dry-passed` only after all four native smoke rows
+succeed; its outcome includes the matrix result.
 The smoke currently follows the dry-run preflight upload; before enabling real
 publication, it must become a required predecessor of every write.
 

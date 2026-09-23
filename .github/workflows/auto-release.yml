@@ -753,7 +753,7 @@ jobs:
 
   record-attempt-outcome:
     name: Record release attempt outcome on issue
-    needs: [validate-attempt, build-and-package, build-binaries, release]
+    needs: [validate-attempt, build-and-package, build-binaries, release, smoke-shipped-assets]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -772,14 +772,19 @@ jobs:
           PACKAGE: ${{ needs.build-and-package.result }}
           BINARIES: ${{ needs.build-binaries.result }}
           RELEASE: ${{ needs.release.result }}
+          SMOKE: ${{ needs.smoke-shipped-assets.result }}
           IS_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           state=blocked
           if [[ "$VALIDATE" == success && "$PACKAGE" == success && "$BINARIES" == success && "$RELEASE" == success ]]; then
-            if [[ "$IS_DRY_RUN" == true ]]; then state=dry-passed; else state=real-passed; fi
+            if [[ "$IS_DRY_RUN" == true && "$SMOKE" == success ]]; then
+              state=dry-passed
+            elif [[ "$IS_DRY_RUN" != true ]]; then
+              state=real-passed
+            fi
           fi
-          results="validate=$VALIDATE,package=$PACKAGE,binaries=$BINARIES,release=$RELEASE"
+          results="validate=$VALIDATE,package=$PACKAGE,binaries=$BINARIES,release=$RELEASE,smoke=$SMOKE"
           python3 ci/release.py record-outcome --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" \
             --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --state "$state" --results "$results"
