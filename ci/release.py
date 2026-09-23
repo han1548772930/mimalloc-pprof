@@ -16,9 +16,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-
-import tomllib
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "zackees/mimalloc-pprof"
@@ -46,11 +44,23 @@ def command(*args: str) -> str:
 
 
 def source_version() -> str:
-    manifest = tomllib.loads((ROOT / "rust/mimalloc-pprof/Cargo.toml").read_text())
-    version = str(manifest["package"]["version"])
-    lock = tomllib.loads((ROOT / "rust/Cargo.lock").read_text())
+    def field(section: str, name: str) -> str:
+        match = re.search(rf'^\s*{re.escape(name)}\s*=\s*"([^"]+)"\s*$', section, re.MULTILINE)
+        if not match:
+            raise ReleaseError(f"missing {name} in Cargo package section")
+        return match.group(1)
+
+    manifest = (ROOT / "rust/mimalloc-pprof/Cargo.toml").read_text()
+    package = re.search(r"(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)", manifest)
+    if not package:
+        raise ReleaseError("Cargo.toml has no [package] section")
+    version = field(package.group(1), "version")
+    lock = (ROOT / "rust/Cargo.lock").read_text()
+    sections = re.findall(r"(?ms)^\[\[package\]\]\s*\n(.*?)(?=^\[\[package\]\]|\Z)", lock)
     locked = [
-        package["version"] for package in lock["package"] if package["name"] == "mimalloc-pprof"
+        field(section, "version")
+        for section in sections
+        if field(section, "name") == "mimalloc-pprof"
     ]
     if locked != [version]:
         raise ReleaseError(
@@ -95,17 +105,20 @@ def parse_directive(body: str) -> dict[str, Any] | None:
     match = re.search(r"```json\n(.*?)\n```", body, re.DOTALL)
     if not match:
         raise ReleaseError("release comment has no JSON directive")
-    value = json.loads(match.group(1))
-    if not isinstance(value, dict) or value.get("schema") != "fleet-release-attempt/v1":
+    value: object = json.loads(match.group(1))
+    if not isinstance(value, dict):
         raise ReleaseError("unrecognized release directive")
-    return value
+    parsed = cast(dict[str, Any], value)
+    if parsed.get("schema") != "fleet-release-attempt/v1":
+        raise ReleaseError("unrecognized release directive")
+    return parsed
 
 
 def issue_comments(issue: int) -> list[str]:
     raw = command(
         "gh", "api", "--paginate", "--slurp", f"repos/{REPO}/issues/{issue}/comments?per_page=100"
     )
-    pages = json.loads(raw)
+    pages = cast(list[list[dict[str, Any]]], json.loads(raw))
     trusted = {"OWNER", "MEMBER", "COLLABORATOR"}
     return [
         str(row["body"])
@@ -175,7 +188,7 @@ def inspect_artifacts(directory: Path, value: dict[str, Any]) -> dict[str, Any]:
         raise ReleaseError(
             f"asset set mismatch: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
         )
-    artifacts = []
+    artifacts: list[dict[str, str | int]] = []
     for name in value["assets"]:
         path = directory / name
         if path.is_symlink():

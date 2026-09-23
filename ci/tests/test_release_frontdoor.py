@@ -14,6 +14,21 @@ SHA = "a" * 40
 
 
 class ReleaseFrontdoorTests(unittest.TestCase):
+    def test_source_version_requires_matching_lockfile(self) -> None:
+        self.assertEqual(release.source_version(), "1.0.0")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            crate = root / "rust/mimalloc-pprof"
+            crate.mkdir(parents=True)
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "mimalloc-pprof"\nversion = "1.0.1"\n'
+            )
+            (root / "rust/Cargo.lock").write_text(
+                '[[package]]\nname = "mimalloc-pprof"\nversion = "1.0.0"\n'
+            )
+            with patch.object(release, "ROOT", root), self.assertRaises(release.ReleaseError):
+                release.source_version()
+
     def test_directive_is_exact_and_full(self) -> None:
         directive = release.directive(444, "1.0.1", SHA)
         self.assertEqual(directive["tag"], "v1.0.1")

@@ -34,3 +34,14 @@ retry transient GitHub failures up to ten times; finalize only after both
 destinations are verified; verify that `v1.0.1` resolves to the candidate SHA.
 Crates.io and GitHub cannot be one atomic transaction, so a partial result must
 stay recorded on the issue and resume without changing identity.
+
+Two additional gates must be closed before the real publisher is enabled:
+
+- The front door currently proves that the candidate is an ancestor of `main`
+  and has the requested version. It must also prove that this SHA is the
+  intended, reviewed version-bump merge commit recorded by the release issue;
+  an arbitrary older main commit with the same version is insufficient.
+- `info.json` currently proves the five outer archive names, sizes, and hashes.
+  The release preflight must inspect each archive's internal target identity and
+  provenance, then prove that the shipped bytes are the same bytes exercised by
+  the exact-SHA full test bundles. A matching filename alone is insufficient.
