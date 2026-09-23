@@ -412,9 +412,15 @@ pub struct PurgeFlags {
 
 impl PurgeFlags {
     /// Every flag clear: honour the purge pacing options and keep every arena.
-    pub const NONE: PurgeFlags = PurgeFlags { force: false, reclaim: false };
+    pub const NONE: PurgeFlags = PurgeFlags {
+        force: false,
+        reclaim: false,
+    };
     /// `MI_PURGE_FORCE`.
-    pub const FORCE: PurgeFlags = PurgeFlags { force: true, reclaim: false };
+    pub const FORCE: PurgeFlags = PurgeFlags {
+        force: true,
+        reclaim: false,
+    };
     /// `MI_PURGE_RECLAIM`: also give back the arenas that are completely
     /// free, their metadata included, instead of leaving them for the process lifetime.
     ///
@@ -445,14 +451,24 @@ impl PurgeFlags {
     ///     assert_eq!(report.subprocs_pending, 0);
     /// }
     /// ```
-    pub const RECLAIM: PurgeFlags = PurgeFlags { force: false, reclaim: true };
+    pub const RECLAIM: PurgeFlags = PurgeFlags {
+        force: false,
+        reclaim: true,
+    };
     /// `MI_PURGE_FORCE | MI_PURGE_RECLAIM`.
-    pub const FORCE_RECLAIM: PurgeFlags = PurgeFlags { force: true, reclaim: true };
+    pub const FORCE_RECLAIM: PurgeFlags = PurgeFlags {
+        force: true,
+        reclaim: true,
+    };
 
     fn to_c(self) -> sys::mi_purge_flags_t {
         let mut flags: sys::mi_purge_flags_t = 0;
-        if self.force { flags |= sys::MI_PURGE_FORCE; }
-        if self.reclaim { flags |= sys::MI_PURGE_RECLAIM; }
+        if self.force {
+            flags |= sys::MI_PURGE_FORCE;
+        }
+        if self.reclaim {
+            flags |= sys::MI_PURGE_RECLAIM;
+        }
         flags
     }
 }

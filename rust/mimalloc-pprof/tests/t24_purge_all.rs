@@ -119,8 +119,7 @@ fn purge_all_reclaim_flag() {
 
     // The positive control: the same call without the flag releases no arena, whatever
     // quiescence it did or did not find.
-    let (status, plain) =
-        mimalloc_pprof::purge_all_ex(mimalloc_pprof::PurgeFlags::FORCE, 100);
+    let (status, plain) = mimalloc_pprof::purge_all_ex(mimalloc_pprof::PurgeFlags::FORCE, 100);
     assert_ne!(status, mimalloc_pprof::PurgeStatus::Busy, "{plain:?}");
     assert!(!plain.reclaimed, "{plain:?}");
     assert_eq!(plain.arenas_reclaimed, 0, "{plain:?}");
