@@ -12,6 +12,13 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 
 ## Hard rules
 
+Ordinary PR and `main` CI use the minimal lane. Add literal `ci-test` for the
+complete C test DAG; add `ci-full` for the release platform matrix, including
+native Intel and Apple Silicon execution. Label changes recompute the mode on
+the same PR head. A release requires full validation from exact-SHA dispatches
+before tagging; the publication workflow remains fail-closed. See
+`docs/ci-gates.md` and `ci/release_full_ci_manifest.v1.json`.
+
 1. **Never commit directly to `main`.** Feature branch → PR → merge. Branch names come from
    the sub-issue. One PR per phase. Conventional commits (`feat:`, `fix:`, `ci:`, `docs:`, `test:`).
 2. **Never mix C-core paths (`src/`, `include/`, `test/`, `CMakeLists.txt`) and `rust/` paths
@@ -27,8 +34,8 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
    MSVC **and** win-gnu are priority platforms — both, always.
    The **macOS** gate is `macos-bundles.yml`. Its routine path uses no Apple hardware
    (#277 phase B2):
-   both Apple arches are cross-built on Linux through soldr on every push/PR (that build is
-   the routine gate). In routine PR/main runs `aarch64` is **compile-only** — a build plus Mach-O header assertions, with
+   both Apple arches are cross-built on Linux through soldr for `ci-full` and
+   selective Darwin PRs. In selective runs `aarch64` is **compile-only** — a build plus Mach-O header assertions, with
    its test-name set checked against the x86_64 bundle. *Executing* the x86_64 bundles inside
    a macOS Recovery guest on a Linux runner (`run-macos-x64-recovery`) is **manual-only**
    (`workflow_dispatch`; owner decision 2026-09-03: ~25–90 min per run cannot gate PRs).

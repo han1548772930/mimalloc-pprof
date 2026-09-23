@@ -2,7 +2,18 @@
 
 *Part of the [mimalloc-pprof](../README.md) documentation.*
 
-Every gate below runs on each PR and is a **hard failure**. Where a gate can have a
+Ordinary PR and default-branch CI run the minimal lane. Literal `ci-test` PRs
+add the complete `c-unit` DAG; `ci-full` PRs run the release platform matrix
+across `c-unit`, `cross`, `rust-native`, `windows-bundles`, and `macos-bundles`.
+Adding or removing either label reruns the selector on the same PR head, even
+for documentation-only changes. The exact-SHA release dispatch runs full mode
+independently of PR labels. The 65-job release manifest and fail-closed
+publication gate remain authoritative; a skipped job does not pass release
+validation. Required check names stay visible in minimal mode, including the
+six macOS build matrix rows, whose costly steps are skipped there. The existing
+selective Darwin PR lane still builds and runs when its path/label decision says so.
+
+Every gate below is a **hard failure when its mode selects it**. Where a gate can have a
 *positive control* — a deliberately broken input it must catch — it has one, because a
 gate that has never been observed to fire proves nothing.
 
@@ -50,9 +61,9 @@ gh workflow run macos-bundles.yml --ref <branch>            # default 3600 s gue
 gh workflow run macos-bundles.yml --ref <branch> -f run-timeout=1800
 ```
 
-Every push/PR still cross-builds all six macOS bundles (both arches) and runs the Mach-O
-and coverage assertions, so a macOS build break is caught immediately; only the execution
-is on demand. Run it before merging changes to macOS-specific paths (`src/prim/osx`,
+Full PR and exact-SHA release runs cross-build all six macOS bundles (both arches)
+and execute them on native Macs. A selective Darwin PR also cross-builds the bundles
+for its Recovery test lane. Run the manual Recovery diagnostic before merging changes to macOS-specific paths (`src/prim/osx`,
 interpose, TLS slots) and when a Linux-green change touches the arena/heap lifecycle.
 
 ### Selective macOS execution on PRs (#339, PR #348)
