@@ -43,6 +43,28 @@ def test_full_dispatch_checks_out_one_merged_sha_and_preserves_pr_merge_checkout
                     assert step["with"]["ref"] == VERIFIED_SHA, (workflow_name, job_name)
 
 
+def test_macos_pr_uses_merge_sha_for_workflow_tools_and_bundles() -> None:
+    workflow = yaml.safe_load((WORKFLOWS / "macos-bundles.yml").read_text())
+    resolver = workflow["jobs"]["resolve-candidate"]
+    resolver_script = resolver["steps"][0]["run"]
+    assert "inputs.candidate_sha || github.sha" in workflow["run-name"]
+    assert "PR_SHA" not in resolver_script
+    assert 'elif [[ "$EVENT" == pull_request ]]; then\n  sha="$EVENT_SHA"' in resolver_script
+    assert resolver["steps"][1]["with"]["ref"] == "${{ steps.candidate.outputs.sha }}"
+
+    # Native full execution calls --exclude, added after older fork heads were cut.
+    # Checking out the fork head would pair the new workflow with an old runner CLI.
+    native = workflow["jobs"]["run-macos-native-full"]
+    checkouts = [step for step in native["steps"] if step.get("uses") == "actions/checkout@v4"]
+    assert len(checkouts) == 1
+    assert checkouts[0]["with"]["ref"] == VERIFIED_SHA
+    assert "--exclude test-osx-zone-introspect-remote" in next(
+        step["run"]
+        for step in native["steps"]
+        if step.get("name") == "Execute the shipped C bundles on native macOS"
+    )
+
+
 def test_full_dispatch_makes_windows_comparison_rows_required() -> None:
     cross = yaml.safe_load((WORKFLOWS / "cross.yml").read_text())["jobs"]
     native = yaml.safe_load((WORKFLOWS / "rust-native.yml").read_text())["jobs"]

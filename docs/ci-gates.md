@@ -496,6 +496,9 @@ macOS runner labels permitted by `ci/lint_no_macos_runners.py` are in that selec
 The full dispatch requires a lowercase 40-hex `candidate_sha`; `resolve-candidate`
 checks out that commit and verifies `git rev-parse HEAD` before any build or execution.
 PR runs use GitHub's synthetic merge commit, matching the other full workflows.
+This matters for fork PRs: checking out the contributor head can pair a newer
+workflow with an older `ci/run_test_bundle.py` that lacks the flags it invokes
+(PR #443 exposed exactly that mismatch with `--exclude`).
 The full run title includes the candidate SHA for release evidence.
 
 The leak bundle is a memory-gate positive control, not an ordinary C test cell. On both
