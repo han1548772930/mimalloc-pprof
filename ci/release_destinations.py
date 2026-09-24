@@ -32,6 +32,7 @@ class ReadableDestination(Protocol):
 
 
 class Destination(ReadableDestination, Protocol):
+    def validate_crate(self, path: Path) -> None: ...
     def freeze(self, record: dict[str, object]) -> None: ...
     def read_freeze(self) -> dict[str, object] | None: ...
     def create_tag(self, tag: str, sha: str) -> None: ...
@@ -264,6 +265,7 @@ def execute(
 ) -> None:
     """Freeze, transfer from one runner, verify all bytes, then publish the draft."""
     plan = preflight(destination, directive, info, dist, crate, frozen)
+    destination.validate_crate(crate)
     tag, sha = str(directive["tag"]), str(directive["candidate_sha"])
     expected_assets = cast(dict[str, str], plan.freeze["asset_sha256"])
 

@@ -31,6 +31,12 @@ class LiveDestination(destinations.ReadOnlyDestination):
     def __init__(self, issue: int, crate: Path) -> None:
         self.issue = issue
         self.crate = crate
+        self._crate_metadata: dict[str, object] | None = None
+
+    def validate_crate(self, path: Path) -> None:
+        if path != self.crate:
+            raise release.ReleaseError("crate path changed before preflight")
+        self._crate_metadata = crate_publish_metadata(path)
 
     @staticmethod
     def _github(*args: str) -> str:
@@ -111,7 +117,9 @@ class LiveDestination(destinations.ReadOnlyDestination):
         frozen = self.read_freeze()
         if frozen is None or frozen.get("crate_sha256") != hashlib.sha256(archive).hexdigest():
             raise release.ReleaseError("crate bytes differ from authoritative issue freeze")
-        metadata = crate_publish_metadata(path)
+        metadata = self._crate_metadata
+        if metadata is None:
+            raise release.ReleaseError("crate publish metadata was not validated in preflight")
         encoded = json.dumps(metadata, separators=(",", ":"), ensure_ascii=False).encode()
         body = struct.pack("<I", len(encoded)) + encoded + struct.pack("<I", len(archive)) + archive
         token = os.environ["CARGO_REGISTRY_TOKEN"]

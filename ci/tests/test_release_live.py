@@ -54,6 +54,7 @@ class LiveUploadTests(unittest.TestCase):
                 patch.object(release_live.urllib.request, "urlopen", side_effect=open_request),
                 patch.dict(os.environ, {"CARGO_REGISTRY_TOKEN": "test-only-token"}),
             ):
+                destination.validate_crate(crate)
                 destination.publish_crate(crate)
             self.assertEqual(len(captured), 1)
             request = captured[0]
@@ -74,9 +75,15 @@ class LiveUploadTests(unittest.TestCase):
             destination = release_live.LiveDestination(444, crate)
             with (
                 patch.object(destination, "read_freeze", return_value={"crate_sha256": "0" * 64}),
+                patch.object(
+                    release_live,
+                    "crate_publish_metadata",
+                    return_value={"name": "mimalloc-pprof", "vers": "1.0.1", "deps": []},
+                ),
                 patch.object(release_live.urllib.request, "urlopen") as upload,
                 self.assertRaisesRegex(ValueError, "authoritative issue freeze"),
             ):
+                destination.validate_crate(crate)
                 destination.publish_crate(crate)
             upload.assert_not_called()
 

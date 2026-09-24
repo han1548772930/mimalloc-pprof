@@ -26,6 +26,11 @@ class FakeDestination:
         self.release_target_is_tag = False
         self.crate_error_after_write = False
         self.freeze_failures = 0
+        self.crate_validation_error: Exception | None = None
+
+    def validate_crate(self, path: Path) -> None:
+        if self.crate_validation_error is not None:
+            raise self.crate_validation_error
 
     def maybe_ambiguous(self, name: str) -> None:
         if name in self.ambiguous_writes:
@@ -149,6 +154,13 @@ class DestinationTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "immutable tag"):
             self.run_worker()
         self.assertEqual(self.backend.events, [])
+
+    def test_crate_metadata_failure_precedes_every_write(self) -> None:
+        self.backend.crate_validation_error = release.ReleaseError("metadata mismatch")
+        with self.assertRaisesRegex(release.ReleaseError, "metadata mismatch"):
+            self.run_worker()
+        self.assertEqual(self.backend.events, [])
+        self.assertIsNone(self.backend.frozen)
         self.backend.tag = None
         self.backend.crate = "0" * 64
         with self.assertRaisesRegex(release.ReleaseError, "crates.io checksum"):
