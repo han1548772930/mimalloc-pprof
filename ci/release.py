@@ -138,6 +138,13 @@ def issue_comments(issue: int, sleep: Callable[[float], None] = time.sleep) -> l
         )
         try:
             parsed: object = json.loads(raw)
+            # gh has emitted both shapes for `api --paginate --slurp` across
+            # runner versions: a list of page arrays and, for a one-page
+            # response, the page array itself.  Normalize the latter before
+            # validating rows so a CLI presentation detail cannot block a
+            # release after every artifact has already passed.
+            if isinstance(parsed, list) and all(isinstance(row, dict) for row in parsed):
+                parsed = [parsed]
             if (
                 not isinstance(parsed, list)
                 or not all(isinstance(page, list) for page in parsed)
@@ -157,7 +164,8 @@ def issue_comments(issue: int, sleep: Callable[[float], None] = time.sleep) -> l
         except json.JSONDecodeError as error:
             if attempt == 9:
                 raise ReleaseError(
-                    "GitHub issue comments returned malformed JSON after 10 attempts"
+                    "GitHub issue comments returned malformed JSON after 10 attempts "
+                    f"(response shape: {_json_shape(raw)})"
                 ) from error
             sleep(min(2**attempt, 30))
     assert pages is not None
@@ -169,6 +177,20 @@ def issue_comments(issue: int, sleep: Callable[[float], None] = time.sleep) -> l
         if row.get("author_association") in trusted
         or row.get("user", {}).get("login") == "github-actions[bot]"
     ]
+
+
+def _json_shape(raw: str) -> str:
+    """Describe an API response without exposing issue-comment contents."""
+    if not raw:
+        return "empty"
+    try:
+        value: object = json.loads(raw)
+    except json.JSONDecodeError:
+        return f"non-json/{len(raw)}-bytes"
+    if not isinstance(value, list):
+        return type(value).__name__
+    kinds = sorted({type(item).__name__ for item in value})
+    return f"list[{','.join(kinds)}]/{len(value)}"
 
 
 def issue_directives(issue: int) -> list[dict[str, Any]]:

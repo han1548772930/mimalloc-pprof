@@ -30,6 +30,13 @@ class ReleaseFrontdoorTests(unittest.TestCase):
             self.assertEqual(release.issue_comments(444, sleep=sleeps.append), ["trusted"])
         self.assertEqual(sleeps, [1])
 
+    def test_issue_comment_read_accepts_single_flat_page_from_gh(self) -> None:
+        response = json.dumps(
+            [{"body": "trusted", "author_association": "OWNER", "user": {"login": "owner"}}]
+        )
+        with patch.object(release, "command", return_value=response):
+            self.assertEqual(release.issue_comments(444), ["trusted"])
+
     def test_issue_comment_read_bounds_malformed_response_retries(self) -> None:
         sleeps: list[float] = []
         with (
@@ -38,6 +45,9 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         ):
             release.issue_comments(444, sleep=sleeps.append)
         self.assertEqual(sleeps, [1, 2, 4, 8, 16, 30, 30, 30, 30])
+        self.assertEqual(release._json_shape(""), "empty")
+        self.assertEqual(release._json_shape("<html>"), "non-json/6-bytes")
+        self.assertEqual(release._json_shape('{"message":"rate limited"}'), "dict")
 
     def test_issue_comment_read_retries_malformed_nested_rows(self) -> None:
         sleeps: list[float] = []
