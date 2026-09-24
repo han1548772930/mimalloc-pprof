@@ -1493,24 +1493,20 @@ class BenchmarkReportTests(unittest.TestCase):
         # #210 dropped the unlabeled throughput/history PNG stubs from the
         # README: only charts with real axes, legend, and values are embedded.
         # The headline numbers stay live dashboard links instead.
-        # The published branch still contains only the four original panels.
-        # New panels must not be embedded as 404s; the completion evaluator
-        # requires all of them once the full #424 run has actually published.
-        published_patterns = set(report.LEGACY_SCALING_PATTERN_IDS)
-        expected = {
-            name: "https://zackees.github.io/mimalloc-pprof/#scaling"
-            for pattern, name in report.SCALING_PANELS.items()
-            if pattern in published_patterns
-        }
+        expected = dict.fromkeys(
+            report.SCALING_PANELS.values(), "https://zackees.github.io/mimalloc-pprof/#scaling"
+        )
+        expected.update(
+            dict.fromkeys(
+                report.DISTRIBUTION_PANELS.values(),
+                "https://zackees.github.io/mimalloc-pprof/#requested-size-distributions",
+            )
+        )
         for image, destination in expected.items():
             raw = (
                 f"https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/{image}"
             )
             self.assertIn(f"]({raw})]({destination})", source)
-        unpublished = set(report.SCALING_PANELS.values()) | set(report.DISTRIBUTION_PANELS.values())
-        for image in unpublished - expected.keys():
-            self.assertNotIn(f"/benchmark-stats/{image}", source)
-        self.assertIn("reports are **not published yet**", source)
         # Every embedded name must be a file the renderer actually emits, or
         # the README links 404 on the published branch.
         self.assertTrue(set(expected) <= report.SITE_FILES)
@@ -2349,6 +2345,52 @@ class BenchmarkReportTests(unittest.TestCase):
         moved["scaling"] = {"placeholder": True}
         with self.assertRaisesRegex(report.ReportError, "may only gain"):
             report.merge_history([base], moved)
+
+    def test_new_scaling_run_supersedes_latest_without_rewriting_history(self) -> None:
+        base = report.history_row(self.with_complete_scaling(self.load_latest()))
+        report.validate_history_row(base, "old history")
+        current = copy.deepcopy(base)
+        scaling = current["scaling"]
+        assert isinstance(scaling, dict)
+        run = scaling["run"]
+        assert isinstance(run, dict)
+        run["run_id"] = "new-scaling-run"
+        old_time = datetime.fromisoformat(str(run["generated_at_utc"]).replace("Z", "+00:00"))
+        run["generated_at_utc"] = (old_time + timedelta(hours=1)).isoformat()
+        report.validate_history_row(current, "replacement history")
+
+        merged = report.merge_history([base], current)
+        self.assertEqual([base], merged)
+        self.assertEqual("new-scaling-run", run["run_id"])
+
+        same_run = copy.deepcopy(current)
+        same_scaling = same_run["scaling"]
+        assert isinstance(same_scaling, dict)
+        same_identity = same_scaling["run"]
+        assert isinstance(same_identity, dict)
+        original_scaling = base["scaling"]
+        assert isinstance(original_scaling, dict)
+        original_run = original_scaling["run"]
+        assert isinstance(original_run, dict)
+        same_identity["run_id"] = original_run["run_id"]
+        with self.assertRaisesRegex(report.ReportError, "newer validated run"):
+            report.merge_history([base], same_run)
+
+        older_run = copy.deepcopy(current)
+        older_scaling = older_run["scaling"]
+        assert isinstance(older_scaling, dict)
+        older_identity = older_scaling["run"]
+        assert isinstance(older_identity, dict)
+        older_identity["generated_at_utc"] = original_run["generated_at_utc"]
+        with self.assertRaisesRegex(report.ReportError, "newer validated run"):
+            report.merge_history([base], older_run)
+
+        edited_metric = copy.deepcopy(current)
+        base_with_memory = copy.deepcopy(base)
+        base_with_memory["memory"] = {"placeholder": 1}
+        edited_metric["memory"] = {"placeholder": 2}
+        with self.assertRaisesRegex(report.ReportError, "may only gain"):
+            report.merge_history([base_with_memory], edited_metric)
 
     def test_axis_uses_one_unit_for_every_tick(self) -> None:
         unit = report.axis_unit(1_644.0)
