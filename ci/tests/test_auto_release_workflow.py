@@ -108,6 +108,9 @@ class AutoReleaseStructureTests(unittest.TestCase):
         script = job_run_text(gate)
         self.assertIn("ci/verify_release_test_bundle.py", script)
         self.assertIn("ci/run_test_bundle.py", script)
+        self.assertIn("--exclude test-osx-zone-introspect-remote", script)
+        self.assertIn("--only test-osx-zone-introspect-remote", script)
+        self.assertIn('sudo -n "$(command -v python3)"', script)
         downloads = [
             step["with"]["name"]
             for step in gate["steps"]
