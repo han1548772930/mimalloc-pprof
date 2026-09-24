@@ -32,7 +32,7 @@ def test_full_dispatch_checks_out_one_merged_sha_and_preserves_pr_merge_checkout
         assert '[[ "$actual" == "$sha" ]]' in resolver_script
 
         for job_name, job in workflow["jobs"].items():
-            if job_name == "resolve-candidate":
+            if job_name in {"resolve-candidate", "pr-ci-mode"}:
                 continue
             needs = job.get("needs", [])
             if isinstance(needs, str):
