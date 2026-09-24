@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4e30dbab of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit fdb37afc of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -13382,9 +13382,31 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       //
       // Off by default (`mi_option_purge_rearm`) because making the deferred purge actually
       // run is not free: it returns more free arena memory but re-faults memory the workload
-      // is about to reuse. Measured on the large-block workloads in #457, ~1.5x the bytes
-      // returned for ~3% throughput on the single-threaded path. When it is off, the stale
-      // arena expire is still recorded below, so nothing is lost -- only deferred.
+      // is about to reuse. Paired A/B (Windows/Release/MSVC, 8 reps, replicated in two
+      // independent sessions) puts the cost at ~1.5-3% throughput, and shows it only on the
+      // SINGLE-THREADED large-block cells (`random-large/1`, `power-of-two-large/1`,
+      // `sparse-large-buffers/1`). The 8-worker cells cannot resolve it -- their CI spans
+      // ~7-25 points and the sign is not reproducible between sessions -- so no figure from
+      // one session there should be quoted. It never moves the peak working set, neither on
+      // `main` nor on top of the compacted spans of #425: the option buys a `purge_delay`
+      // that does what it says, not a smaller footprint.
+      //
+      // The cost is a property of the PURGE MECHANISM, not of this re-arm. `purge_decommits`
+      // defaults to 1, i.e. `VirtualFree(.., MEM_DECOMMIT)` (src/prim/windows/prim.c), so
+      // every range this option successfully returns has to be recommitted and re-zeroed on
+      // reuse -- and per the MEM_RESET documentation decommit is also what puts the pages
+      // back through the paging file. The reset path (`_mi_prim_reset`:
+      // `VirtualAlloc(MEM_RESET)` + `VirtualUnlock`) keeps the range committed, so no
+      // recommit, while `VirtualUnlock` still releases the pages from the process's working
+      // set, so the memory still goes back to the OS. Setting `purge_decommits=0` removes the
+      // measured cost on the two cells where it reproduces -- two sessions, sign flip:
+      // `random-large/1` -1.63/-2.32% -> +0.45/+0.80%, `power-of-two-large/1` -1.95/-1.41%
+      // -> +1.25/+1.04% -- and roughly halves it on the third (`sparse-large-buffers/1`
+      // -1.60/-3.31% -> -0.70/-1.35%). Recommended pairing:
+      //   MIMALLOC_PURGE_REARM=1 MIMALLOC_PURGE_DECOMMITS=0
+      //
+      // When it is off, the stale arena expire is still recorded below, so nothing is lost --
+      // only deferred.
       if (mi_option_is_enabled(mi_option_purge_rearm)) {
         // Re-arm from this arena's own pending deadline, which is the value the settle CAS
         // would have written, so this restores the intended invariant rather than adding a
@@ -21754,7 +21776,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 100,    MI_OPTION_UNINIT, MI_OPTION(purge_holes_min_interval) } // min milli-seconds between two sweeps of the same thread's heaps
   ,{ 64,     MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) }   // every N'th sweep walks every page regardless of the skip check; 0 disables (Bun's default)
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) }       // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks. Bun parity (#338)
-  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_rearm) }            // re-arm an orphaned subproc purge deadline so the deferred arena purge runs on schedule (=0, #457). Costs throughput when on.
+  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_rearm) }            // re-arm an orphaned subproc purge deadline so the deferred arena purge runs on schedule (=0, #457). Costs ~1.5-3% throughput on single-threaded large-block workloads, not on the peak; see src/arena.c for why pairing it with purge_decommits=0 removes that cost.
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
