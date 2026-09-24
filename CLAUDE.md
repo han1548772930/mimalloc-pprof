@@ -23,7 +23,10 @@ Ordinary PR and `main` CI use the minimal lane. Add literal `ci-test` for the
 complete C test DAG; add `ci-full` for the release platform matrix, including
 native Intel and Apple Silicon execution. Label changes recompute the mode on
 the same PR head. A release requires full validation from exact-SHA dispatches
-before tagging; the publication workflow remains fail-closed. See
+before tagging. Real publication requires the issue freeze, matching packaged
+crate, exact-SHA full CI, and shipped-asset smoke gates. The issue body must
+explicitly say `- State: **ready-to-publish**.`; a dry run never sets that state.
+See
 `docs/ci-gates.md` and `ci/release_full_ci_manifest.v1.json`.
 
 1. **Never commit directly to `main`.** Feature branch → PR → merge. Branch names come from

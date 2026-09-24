@@ -219,6 +219,14 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         ):
             run.return_value.returncode = 0
             release.validate_candidate(value, require_registry_free=False)
+            with self.assertRaisesRegex(release.ReleaseError, "ready-to-publish"):
+                release.validate_candidate(
+                    value, require_registry_free=False, require_issue_ready=True
+                )
+            issue_record = json.loads(responses["issue"])
+            issue_record["body"] = "- State: **ready-to-publish**.\n" + issue_record["body"]
+            responses["issue"] = json.dumps(issue_record)
+            release.validate_candidate(value, require_registry_free=False, require_issue_ready=True)
             responses["issue"] = responses["issue"].replace("#1000", "#999")
             with self.assertRaisesRegex(release.ReleaseError, "candidate differs"):
                 release.validate_candidate(value, require_registry_free=False)

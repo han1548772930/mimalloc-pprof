@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +24,8 @@ class FakeDestination:
         self.ambiguous_writes: set[str] = set()
         self.freeze_visible = True
         self.release_target_is_tag = False
+        self.crate_error_after_write = False
+        self.freeze_failures = 0
 
     def maybe_ambiguous(self, name: str) -> None:
         if name in self.ambiguous_writes:
@@ -47,6 +50,9 @@ class FakeDestination:
         return self.crate
 
     def freeze(self, record: dict[str, object]) -> None:
+        if self.freeze_failures:
+            self.freeze_failures -= 1
+            raise rd.TransientGitHubError("HTTP 503")
         self.frozen = record
         self.events.append("freeze")
 
@@ -74,6 +80,9 @@ class FakeDestination:
     def publish_crate(self, path: Path) -> None:
         self.crate = rd.file_sha256(path)
         self.events.append("crate")
+        if self.crate_error_after_write:
+            self.crate_error_after_write = False
+            raise RuntimeError("response lost after registry accepted crate")
 
     def finalize(self, tag: str) -> None:
         self.draft = False
@@ -89,7 +98,7 @@ class DestinationTests(unittest.TestCase):
         self.value = release.directive(444, "1.0.1", "a" * 40)
         for name in self.value["assets"]:
             (self.dist / name).write_bytes(name.encode())
-        self.crate = self.dist / "package.crate"
+        self.crate = self.dist / "mimalloc-pprof-1.0.1.crate"
         self.crate.write_bytes(b"packed crate")
         self.info: dict[str, object] = {
             "artifacts": [
@@ -128,6 +137,12 @@ class DestinationTests(unittest.TestCase):
         self.backend.upload_failures = 9
         self.run_worker()
         self.assertEqual(len(self.backend.assets), 5)
+
+    def test_issue_freeze_retries_transient_failures_before_tag(self) -> None:
+        self.backend.freeze_failures = 9
+        self.run_worker()
+        self.assertEqual(self.backend.events[0], "freeze")
+        self.assertEqual(self.backend.freeze_failures, 0)
 
     def test_permanent_error_fails_fast(self) -> None:
         self.backend.tag = "b" * 40
@@ -182,6 +197,41 @@ class DestinationTests(unittest.TestCase):
             patch.object(rd.ReadOnlyDestination, "_gh_required", return_value=tag_obj),
         ):
             self.assertEqual(rd.ReadOnlyDestination().tag_sha("v1.0.1"), "a" * 40)
+
+    def test_oversized_crate_fails_before_freeze(self) -> None:
+        with self.crate.open("wb") as handle:
+            handle.truncate(rd.MAX_CRATE_BYTES + 1)
+        with self.assertRaisesRegex(release.ReleaseError, "10 MB"):
+            self.run_worker()
+        self.assertEqual(self.backend.events, [])
+
+    def test_ambiguous_registry_acceptance_reconciles_before_finalize(self) -> None:
+        self.backend.crate_error_after_write = True
+        self.run_worker()
+        self.assertEqual(self.backend.events.count("crate"), 1)
+        self.assertFalse(self.backend.draft)
+
+    def test_assets_and_crate_transfer_overlap(self) -> None:
+        barrier = threading.Barrier(2, timeout=2)
+        original_upload = self.backend.upload_asset
+        original_crate = self.backend.publish_crate
+        first_upload = True
+
+        def upload(tag: str, name: str, path: Path) -> None:
+            nonlocal first_upload
+            if first_upload:
+                first_upload = False
+                barrier.wait()
+            original_upload(tag, name, path)
+
+        def publish(path: Path) -> None:
+            barrier.wait()
+            original_crate(path)
+
+        self.backend.upload_asset = upload  # type: ignore[method-assign]
+        self.backend.publish_crate = publish  # type: ignore[method-assign]
+        self.run_worker()
+        self.assertFalse(self.backend.draft)
 
 
 if __name__ == "__main__":
