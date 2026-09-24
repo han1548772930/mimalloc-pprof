@@ -21,7 +21,7 @@ PARENT = "c" * 40
 
 class ReleaseFrontdoorTests(unittest.TestCase):
     def test_source_version_requires_matching_lockfile(self) -> None:
-        self.assertEqual(release.source_version(), "1.0.0")
+        self.assertEqual(release.source_version(), "1.0.1")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             crate = root / "rust/mimalloc-pprof"
