@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 650c0362 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ff966474 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -11884,6 +11884,7 @@ static mi_page_t* mi_arenas_page_singleton_alloc(mi_theap_t* theap, size_t block
 // page itself (`mi_page_arena_pages`) rather than assume the bin implies it --
 // see `mi_arenas_page_try_find_abandoned`.
 static size_t mi_dynamic_large_page_size(mi_theap_t* theap, size_t block_size) {
+  MI_UNUSED(block_size);
   // Compacting spans trades fewer resident holes for more page/span churn. Keep
   // the original geometry for low-concurrency heaps; aggregate pressure from a
   // real worker pool is where the resident-space win pays for that trade.
@@ -11891,10 +11892,13 @@ static size_t mi_dynamic_large_page_size(mi_theap_t* theap, size_t block_size) {
       mi_atomic_load_relaxed(&theap->tld->subproc->thread_count) < 4) {
     return MI_LARGE_PAGE_SIZE;
   }
-  // Exact power-of-two classes are the hot reuse path in the scaling suite;
-  // keep their original span size even when other classes compact.
-  if (_mi_is_power_of_two(block_size)) return MI_LARGE_PAGE_SIZE;
-  // Irregular classes use 1 MiB spans under sustained worker pressure.
+  // Every large class compacts under sustained worker pressure. Power-of-two
+  // classes used to be excluded here as "the hot reuse path in the scaling
+  // suite", but on a 4 KiB OS page a 4 MiB page needs 1024 purge bits against a
+  // ceiling of 256 and can never be hole-punched, while 1 MiB needs exactly 256
+  // and can. Peak attribution on `random-large/8` put 100% of the remaining
+  // unpunchable free space in three power-of-two classes (2^17, 2^18, 2^19) as
+  // about one empty 4 MiB page per worker, so they compact with the rest.
   return MI_ARENA_SLICE_SIZE * 16;
 }
 
