@@ -12,6 +12,7 @@ import hashlib
 import json
 import posixpath
 import re
+import stat
 import struct
 import subprocess
 import sys
@@ -409,12 +410,21 @@ def archive_members(path: Path) -> dict[str, bytes]:
         if path.name.endswith(".zip"):
             with zipfile.ZipFile(path) as archive:
                 total = 0
+                seen_zip_names: set[str] = set()
                 for row in archive.infolist():
+                    if row.filename in seen_zip_names:
+                        raise ReleaseError(f"duplicate archive member {row.filename}")
+                    seen_zip_names.add(row.filename)
                     total += row.file_size
+                    unix_type = (
+                        stat.S_IFMT(row.external_attr >> 16) if row.create_system == 3 else 0
+                    )
                     if (
                         row.file_size > MAX_ASSET_BYTES
                         or total > MAX_ASSET_BYTES
-                        or (row.external_attr >> 16) & 0o170000 == 0o120000
+                        or unix_type not in (0, stat.S_IFREG, stat.S_IFDIR)
+                        or (unix_type == stat.S_IFREG and row.is_dir())
+                        or (unix_type == stat.S_IFDIR and not row.is_dir())
                     ):
                         raise ReleaseError(f"invalid archive member {row.filename}")
                     entries.append(

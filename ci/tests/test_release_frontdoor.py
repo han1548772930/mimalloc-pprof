@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import struct
 import tarfile
 import tempfile
@@ -166,6 +167,59 @@ class ReleaseFrontdoorTests(unittest.TestCase):
                 link.linkname = "real.dylib"
                 archive.addfile(link)
             self.assertIn("lib/link.dylib", release.archive_members(tar_path))
+
+    def test_zip_member_types_and_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "asset.zip"
+            for label, mode in (
+                ("symlink", stat.S_IFLNK),
+                ("character device", stat.S_IFCHR),
+                ("block device", stat.S_IFBLK),
+                ("fifo", stat.S_IFIFO),
+                ("socket", stat.S_IFSOCK),
+                ("unknown", 0o150000),
+            ):
+                with self.subTest(label=label):
+                    member = zipfile.ZipInfo("bin/unsafe")
+                    member.create_system = 3
+                    member.external_attr = (mode | 0o644) << 16
+                    with zipfile.ZipFile(path, "w") as archive:
+                        archive.writestr(member, b"payload")
+                    with self.assertRaisesRegex(release.ReleaseError, "invalid archive member"):
+                        release.archive_members(path)
+            for name in ("bin/duplicate", "bin/duplicate/"):
+                with self.subTest(duplicate=name):
+                    with zipfile.ZipFile(path, "w") as archive:
+                        archive.writestr(name, b"" if name.endswith("/") else b"first")
+                        archive.writestr(name, b"" if name.endswith("/") else b"second")
+                    with self.assertRaisesRegex(release.ReleaseError, "duplicate archive member"):
+                        release.archive_members(path)
+            native = Path(temporary) / "native"
+            native.write_bytes(b"native")
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("bin/plain", b"plain")
+                archive.write(native, "bin/native")
+                unix_file = zipfile.ZipInfo("bin/unix")
+                unix_file.create_system = 3
+                unix_file.external_attr = (stat.S_IFREG | 0o644) << 16
+                archive.writestr(unix_file, b"unix")
+                unix_dir = zipfile.ZipInfo("bin/dir/")
+                unix_dir.create_system = 3
+                unix_dir.external_attr = (stat.S_IFDIR | 0o755) << 16
+                archive.writestr(unix_dir, b"")
+                dos_file = zipfile.ZipInfo("bin/dos")
+                dos_file.create_system = 0
+                dos_file.external_attr = 0x20
+                archive.writestr(dos_file, b"dos")
+            self.assertEqual(
+                release.archive_members(path),
+                {
+                    "bin/plain": b"plain",
+                    "bin/native": b"native",
+                    "bin/unix": b"unix",
+                    "bin/dos": b"dos",
+                },
+            )
 
     def test_candidate_requires_recorded_version_bump_merge(self) -> None:
         self.assertEqual(release.recorded_merge_sha(f"- Candidate merge SHA: **{SHA}**"), SHA)
