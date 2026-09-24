@@ -135,7 +135,8 @@ def issue_comments(issue: int, sleep: Callable[[float], None] = time.sleep) -> l
             "--paginate",
             f"repos/{REPO}/issues/{issue}/comments?per_page=100",
             "--jq",
-            "[.[] | {body: .body, author_association: .author_association, login: .user.login}]",
+            "[.[] | {body: .body, author_association: .author_association, "
+            "login: .user.login}] | @json",
         )
         try:
             if not raw:
