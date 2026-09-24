@@ -2635,11 +2635,46 @@ def merge_history(
         optional = {"memory", "latency", "scaling"}
         previous_base = {key: value for key, value in row.items() if key not in optional}
         current_base = {key: value for key, value in current.items() if key not in optional}
-        gained = (set(current) & optional) - (set(row) & optional)
-        if not equivalent_payload(previous_base, current_base) or not gained:
+        previous_optional = set(row) & optional
+        current_optional = set(current) & optional
+        gained = current_optional - previous_optional
+        changed = {
+            key
+            for key in previous_optional & current_optional
+            if not equivalent_payload(row[key], current[key])
+        }
+        if (
+            not equivalent_payload(previous_base, current_base)
+            or not previous_optional <= current_optional
+            or changed - {"scaling"}
+            or (not gained and not changed)
+        ):
             fail("history append: duplicate run may only gain a validated optional metric")
+        if "scaling" in changed:
+            old_scaling = validate_scaling_report(row["scaling"], "history.scaling", compact=True)
+            new_scaling = validate_scaling_report(
+                current["scaling"], "history replacement.scaling", compact=True
+            )
+            old_run = object_value(old_scaling["run"], "history.scaling.run")
+            new_run = object_value(new_scaling["run"], "history replacement.scaling.run")
+            old_identity = (old_run["run_id"], old_run["run_attempt"])
+            new_identity = (new_run["run_id"], new_run["run_attempt"])
+            old_time = parse_timestamp(
+                cast(str, old_run["generated_at_utc"]), "history.scaling timestamp"
+            )
+            new_time = parse_timestamp(
+                cast(str, new_run["generated_at_utc"]), "replacement.scaling timestamp"
+            )
+            if (
+                new_identity == old_identity
+                or new_time <= old_time
+                or SCALING_SCHEMAS.index(cast(str, new_scaling["metric_schema_version"]))
+                < SCALING_SCHEMAS.index(cast(str, old_scaling["metric_schema_version"]))
+            ):
+                fail("history append: scaling replacement requires a newer validated run")
         # Keep the row exactly as it was first published and add only the newly
-        # collected metric. Rewriting it from the round-tripped envelope would
+        # collected metric. A newer scaling report replaces only latest.json;
+        # the old scaling history row remains immutable. Rewriting it would
         # silently move already-published numbers by the same round-trip noise
         # this comparison tolerates.
         combined[index] = dict(row) | {key: current[key] for key in sorted(gained)}
