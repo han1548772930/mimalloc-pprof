@@ -21,6 +21,39 @@ PARENT = "c" * 40
 
 
 class ReleaseFrontdoorTests(unittest.TestCase):
+    def test_issue_comment_read_retries_empty_success_response(self) -> None:
+        sleeps: list[float] = []
+        response = json.dumps(
+            [[{"body": "trusted", "author_association": "OWNER", "user": {"login": "owner"}}]]
+        )
+        with patch.object(release, "command", side_effect=["", response]):
+            self.assertEqual(release.issue_comments(444, sleep=sleeps.append), ["trusted"])
+        self.assertEqual(sleeps, [1])
+
+    def test_issue_comment_read_bounds_malformed_response_retries(self) -> None:
+        sleeps: list[float] = []
+        with (
+            patch.object(release, "command", return_value=""),
+            self.assertRaisesRegex(release.ReleaseError, "after 10 attempts"),
+        ):
+            release.issue_comments(444, sleep=sleeps.append)
+        self.assertEqual(sleeps, [1, 2, 4, 8, 16, 30, 30, 30, 30])
+
+    def test_issue_comment_read_retries_malformed_nested_rows(self) -> None:
+        sleeps: list[float] = []
+        with patch.object(release, "command", side_effect=["[[null]]", "[[]]"]):
+            self.assertEqual(release.issue_comments(444, sleep=sleeps.append), [])
+        self.assertEqual(sleeps, [1])
+
+    def test_issue_comment_read_does_not_retry_command_failure(self) -> None:
+        sleeps: list[float] = []
+        with (
+            patch.object(release, "command", side_effect=release.ReleaseError("auth failed")),
+            self.assertRaisesRegex(release.ReleaseError, "auth failed"),
+        ):
+            release.issue_comments(444, sleep=sleeps.append)
+        self.assertEqual(sleeps, [])
+
     def test_source_version_requires_matching_lockfile(self) -> None:
         self.assertEqual(release.source_version(), "1.0.1")
         with tempfile.TemporaryDirectory() as temporary:
