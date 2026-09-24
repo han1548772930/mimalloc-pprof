@@ -2586,7 +2586,34 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       }
     }
     else {
-      // already an expiration was set
+      // Already an expiration was set on THIS arena -- but that does not imply the
+      // subproc-level deadline still is. `subproc->purge_expire` is the only field the
+      // opportunistic path checks (`_mi_arenas_try_purge` returns early while it is 0) and
+      // the only deadline the scavenger waits on, and it is cleared to 0 both by that
+      // function's settle CAS and by the scavenger's own stale-value CAS, while this
+      // arena's expire can stay set. Once the two disagree nothing re-arms the pair, every
+      // opportunistic purge is skipped, and the scavenger parks on its safety net -- so
+      // free arena space is only returned when something forces `mi_collect(true)`, and
+      // `purge_delay` has no effect at all (#457).
+      //
+      // Off by default (`mi_option_purge_rearm`) because making the deferred purge actually
+      // run is not free: it returns more free arena memory but re-faults memory the workload
+      // is about to reuse. Measured on the large-block workloads in #457, ~1.5x the bytes
+      // returned for ~3% throughput on the single-threaded path. When it is off, the stale
+      // arena expire is still recorded below, so nothing is lost -- only deferred.
+      if (mi_option_is_enabled(mi_option_purge_rearm)) {
+        // Re-arm from this arena's own pending deadline, which is the value the settle CAS
+        // would have written, so this restores the intended invariant rather than adding a
+        // policy. The CAS keeps an earlier value if one is already there, and the relaxed
+        // pre-check keeps the common case down to a plain load.
+        const mi_msecs_t aexpire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+        if (aexpire != 0 && mi_atomic_loadi64_relaxed(&arena->subproc->purge_expire) == 0) {
+          mi_msecs_t sexp0 = 0;
+          if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &sexp0, aexpire)) {
+            _mi_scavenger_wake(arena->subproc);
+          }
+        }
+      }
     }
     mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
   }
