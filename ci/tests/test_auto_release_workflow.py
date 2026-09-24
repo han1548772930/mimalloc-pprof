@@ -81,13 +81,16 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 "platform is chosen by the cross toolchain now, not by the runner",
             )
 
-    def test_release_waits_for_every_build_job(self) -> None:
+    def test_publication_waits_for_archive_collation_and_both_native_gates(self) -> None:
         release = self.jobs()["release"]
-        needs = release["needs"]
-        self.assertIsInstance(needs, list)
-        self.assertIn("build-and-package", needs)
-        self.assertIn("build-binaries", needs)
-        self.assertIn("test-shipped-assets", needs)
+        preflight = self.jobs()["preflight-assets"]
+        smoke = self.jobs()["smoke-shipped-assets"]
+        self.assertEqual(
+            sorted(preflight["needs"]),
+            ["build-and-package", "build-binaries", "test-shipped-assets"],
+        )
+        self.assertEqual(smoke["needs"], ["preflight-assets"])
+        self.assertEqual(sorted(release["needs"]), ["preflight-assets", "smoke-shipped-assets"])
 
     def test_release_test_gate_uses_all_native_hosts_and_exact_bytes(self) -> None:
         gate = self.jobs()["test-shipped-assets"]
@@ -135,7 +138,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
             toolchain = ROOT / "cmake" / "toolchains" / f"soldr-{triple}.cmake"
             self.assertTrue(toolchain.is_file(), f"missing {toolchain}")
 
-    def test_every_uploaded_artifact_is_downloaded_by_release(self) -> None:
+    def test_archive_inputs_are_collated_then_exact_result_reaches_release(self) -> None:
         uploaded: set[str] = set()
         for name, job in self.jobs().items():
             if name in ("release", "smoke-shipped-assets"):
@@ -145,7 +148,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
                     uploaded.add(str(step["with"]["name"]))
         downloaded: set[str] = set()
         patterns: list[str] = []
-        for step in self.jobs()["release"]["steps"]:
+        for step in self.jobs()["preflight-assets"]["steps"]:
             if str(step.get("uses", "")).startswith("actions/download-artifact"):
                 with_ = cast(dict[str, Any], step["with"])
                 if "name" in with_:
@@ -160,14 +163,22 @@ class AutoReleaseStructureTests(unittest.TestCase):
             )
             self.assertTrue(
                 covered,
-                f"artifact {artifact!r} is uploaded but never downloaded by `release`; it "
+                f"artifact {artifact!r} is uploaded but never downloaded by `preflight-assets`; it "
                 "would not reach the GitHub Release",
             )
+        release_downloads = [
+            step["with"]["name"]
+            for step in self.jobs()["release"]["steps"]
+            if str(step.get("uses", "")).startswith("actions/download-artifact")
+        ]
+        self.assertEqual(release_downloads, ["release-preflight-${{ inputs.candidate_sha }}"])
+        self.assertIn("ci/release.py verify-artifacts", job_run_text(self.jobs()["release"]))
 
-    def test_dry_run_smokes_every_shipped_archive_on_matching_host(self) -> None:
+    def test_every_attempt_smokes_shipped_archives_before_publication(self) -> None:
         smoke = self.jobs()["smoke-shipped-assets"]
-        self.assertEqual(smoke["if"], "inputs.dry_run == true")
-        self.assertEqual(smoke["needs"], ["release"])
+        self.assertNotIn("if", smoke)
+        self.assertEqual(smoke["needs"], ["preflight-assets"])
+        self.assertIn("smoke-shipped-assets", self.jobs()["release"]["needs"])
         self.assertEqual(
             {row["asset"]: row["runner"] for row in smoke["strategy"]["matrix"]["include"]},
             {
@@ -214,7 +225,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
         files = [line for line in files if line]
         # The architecture-independent amalgamation ZIP plus one archive per cross lane.
         self.assertEqual(len(files), 1 + len(EXPECTED_LANES), files)
-        rename_text = job_run_text(release)
+        rename_text = job_run_text(self.jobs()["preflight-assets"])
         for asset, (_, ext) in EXPECTED_LANES.items():
             attached = [f for f in files if f"mimalloc-pprof-{asset}-" in f]
             self.assertEqual(
@@ -251,15 +262,16 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 )
             ):
                 self.assertEqual(step.get("if"), "env.IS_DRY_RUN != 'true'", source)
-        tag_step = next(
+        tag_step = next(step for step in steps if step.get("name") == "Determine release tag")
+        tag_script = tag_step["run"]
+        self.assertIn('echo "tag=v${version}"', tag_script)
+        self.assertNotIn("git tag", tag_script)
+        gh_release = next(
             step
             for step in steps
-            if step.get("name") == "Determine artifact suffix and release tag"
+            if str(step.get("uses", "")).startswith("softprops/action-gh-release")
         )
-        tag_script = tag_step["run"]
-        self.assertIn('echo "suffix=v${version}"', tag_script)
-        self.assertNotIn("git tag", tag_script)
-        self.assertIn("steps.tag.outputs.suffix", job_run_text(release))
+        self.assertEqual(gh_release["with"]["tag_name"], "${{ steps.tag.outputs.tag }}")
         self.assertIn(
             "soldr cargo publish --dry-run -p mimalloc-pprof --locked",
             job_run_text(release),
@@ -274,9 +286,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
         self.assertIn("full_run_id", inputs)
         release = self.jobs()["release"]
         tag_step = next(
-            step
-            for step in release["steps"]
-            if step.get("name") == "Determine artifact suffix and release tag"
+            step for step in release["steps"] if step.get("name") == "Determine release tag"
         )
         self.assertNotIn("GITHUB_REF_NAME", tag_step["run"])
         gate = next(

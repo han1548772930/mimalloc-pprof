@@ -61,9 +61,16 @@ crates.io checksum, then prints the missing outputs and proposed freeze record.
 The `.crate` must be outside the five-archive directory. This command makes no
 issue comment, tag, release, upload, or registry write. The tested state-machine
 interface in `ci/release_destinations.py` freezes before its first write,
-rechecks destinations after upload, and retries only explicitly transient
+requires authoritative issue readback of that freeze before a tag or upload,
+resolves existing annotated tags and release tag references to the candidate,
+rechecks destinations after ambiguous writes, and retries only explicitly transient
 GitHub failures (ten attempts, exponential delays capped at 30 seconds).
 There is deliberately no live write adapter or workflow call to it yet.
+
+The real publisher is still **no-go**. Its live adapter must bind the crate
+checksum to the exact successful Cargo package and dry run, enforce the
+registry's upload-size and version rules, and verify the registry checksum on
+resume before this workflow's explicit failing gate may be removed.
 
 The archive inspection gate now checks the C ZIP against candidate vendor files,
 checks binary archive `PROVENANCE.txt` commit/target fields, and checks the
@@ -73,16 +80,16 @@ full test jobs executed the same library bytes: `auto-release.yml` builds its
 installable assets in separate jobs from `macos-bundles.yml` and
 `windows-bundles.yml`, whose test bundles are built again.
 
-The dry-run worker also downloads its preflight artifact in four native
-`smoke-shipped-assets` jobs (hosted Intel Mac, Apple Silicon Mac, and two Windows
-DLL lanes). Each job checks the exact candidate checkout, compares the outer
-archive and the packaged library's SHA-256 with `info.json`, then calls
-`mi_malloc` and `mi_free` through that packaged library. This is an allocation
-smoke, not the full suite, and the real publication path remains fail-closed.
-The control issue records `dry-passed` only after all four native smoke rows
-succeed; its outcome includes the matrix result.
-The allocation smoke follows the dry-run preflight upload. The stronger
-release-local C suite is already a predecessor of every publication step.
+The worker collates and hashes its five archives in `preflight-assets`, then
+downloads that exact preflight artifact in four native `smoke-shipped-assets`
+jobs (hosted Intel Mac, Apple Silicon Mac, and two Windows DLL lanes). Every
+dry or real attempt checks the exact candidate checkout, compares the outer
+archive and packaged library SHA-256 with `info.json`, then calls `mi_malloc`
+and `mi_free` through that packaged library. The `release` job depends on all
+four smoke rows and re-verifies the same archived bytes before any possible
+publication step. This allocation smoke is in addition to the release-local C
+suite, which also precedes publication. The real publication path remains
+fail-closed.
 
 The release worker now builds its C test executables in the same tree as the
 installed product libraries, with `MI_DHAT=OFF` retained. A release-local native

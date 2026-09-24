@@ -33,6 +33,7 @@ class ReadableDestination(Protocol):
 
 class Destination(ReadableDestination, Protocol):
     def freeze(self, record: dict[str, object]) -> None: ...
+    def read_freeze(self) -> dict[str, object] | None: ...
     def create_tag(self, tag: str, sha: str) -> None: ...
     def create_draft(self, tag: str, sha: str) -> None: ...
     def upload_asset(self, tag: str, name: str, path: Path) -> None: ...
@@ -178,7 +179,10 @@ def preflight(
     if existing_tag is not None and existing_tag != sha:
         raise release.ReleaseError("immutable tag points to another candidate")
     existing_release = destination.release(tag)
-    if existing_release is not None and existing_release.target_sha != sha:
+    if existing_release is not None and not (
+        existing_release.target_sha == sha
+        or (existing_release.target_sha == tag and existing_tag == sha)
+    ):
         raise release.ReleaseError("GitHub Release targets another candidate")
     expected = record["asset_sha256"]
     assert isinstance(expected, dict)
@@ -256,7 +260,10 @@ def execute(
         observed = destination.release(tag)
         if observed is None:
             return False
-        if observed.target_sha != sha:
+        if not (
+            observed.target_sha == sha
+            or (observed.target_sha == tag and destination.tag_sha(tag) == sha)
+        ):
             raise release.ReleaseError("GitHub Release targets another candidate")
         return observed.draft == draft
 
@@ -264,7 +271,10 @@ def execute(
         observed = destination.release(tag)
         if observed is None:
             return False
-        if observed.target_sha != sha:
+        if not (
+            observed.target_sha == sha
+            or (observed.target_sha == tag and destination.tag_sha(tag) == sha)
+        ):
             raise release.ReleaseError("GitHub Release targets another candidate")
         digest = observed.assets.get(name)
         if digest is not None and digest != expected_assets[name]:
@@ -273,7 +283,10 @@ def execute(
 
     if frozen is None:
         destination.freeze(plan.freeze)
-        log("issue: frozen directive, info.json, asset hashes, and crate hash")
+    authoritative_freeze = destination.read_freeze()
+    if authoritative_freeze != plan.freeze:
+        raise release.ReleaseError("issue freeze readback differs from packaged release identity")
+    log("issue: verified frozen directive, info.json, asset hashes, and crate hash")
     if plan.missing_tag:
         github_retry(
             lambda: destination.create_tag(tag, sha),

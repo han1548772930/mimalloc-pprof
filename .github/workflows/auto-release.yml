@@ -515,12 +515,56 @@ jobs:
           tar -C release-test-bundle -xzf "$bundle"
           python3 ci/run_test_bundle.py release-test-bundle
 
+  preflight-assets:
+    name: Collate and validate exact release archives
+    needs: [build-and-package, build-binaries, test-shipped-assets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: mimalloc-pprof-c-zip
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-binaries-*
+          merge-multiple: true
+          path: dist
+      - name: Name the five archives for the source version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("rust/mimalloc-pprof/Cargo.toml", "rb"))["package"]["version"])')
+          tag="v${version}"
+          mv dist/mimalloc-pprof-c.zip "dist/mimalloc-pprof-c-${tag}.zip"
+          for asset in macos-arm64 macos-x86_64 windows-x64-gnu windows-x64-msvc; do
+            case "$asset" in macos-*) ext=tar.gz ;; *) ext=zip ;; esac
+            mv "dist/mimalloc-pprof-${asset}.${ext}" "dist/mimalloc-pprof-${asset}-${tag}.${ext}"
+          done
+      - name: Record and verify exact archive identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: python3 ci/release.py preflight-artifacts --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" --dist dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-preflight-${{ inputs.candidate_sha }}
+          path: dist/
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release + publish to crates.io
     # build-binaries is a hard dependency, not a best-effort extra: a release that
     # published to crates.io and then shipped three of its four platform archives would be
     # a release nobody can tell is incomplete. `release-outcome` says so out loud too.
-    needs: [build-and-package, build-binaries, test-shipped-assets]
+    needs: [preflight-assets, smoke-shipped-assets]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -628,70 +672,24 @@ jobs:
           target-dir: rust/target
           build-cache-mode: full
 
-      - name: Download release ZIP artifact
+      - name: Download archives already tested on native hosts
         uses: actions/download-artifact@v4
         with:
-          name: mimalloc-pprof-c-zip
+          name: release-preflight-${{ inputs.candidate_sha }}
           path: dist
+      - name: Verify the release worker received the exact tested archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: python3 ci/release.py verify-artifacts --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" --dist dist
 
-      - name: Download the cross-built binary assets
-        uses: actions/download-artifact@v4
-        with:
-          # merge-multiple so all four land directly in dist/ rather than in one
-          # subdirectory each -- the rename step and `files:` below both glob dist/.
-          pattern: release-binaries-*
-          merge-multiple: true
-          path: dist
-
-      - name: Determine artifact suffix and release tag
+      - name: Determine release tag
         id: tag
         shell: bash
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("rust/mimalloc-pprof/Cargo.toml", "rb"))["package"]["version"])')
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
-          echo "suffix=v${version}" >> "$GITHUB_OUTPUT"
-
-      - name: Rename assets to versioned artifact names, and require all five
-        # Five, counted: the architecture-independent C amalgamation ZIP plus one archive
-        # per cross lane. `needs:` already makes a failed lane fail this job, but an
-        # artifact that uploaded *nothing* under a green step would otherwise reach
-        # softprops/action-gh-release as a silently shorter `files:` list.
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag='${{ steps.tag.outputs.suffix }}'
-          mv dist/mimalloc-pprof-c.zip "dist/mimalloc-pprof-c-${tag}.zip"
-          for asset in macos-arm64 macos-x86_64 windows-x64-gnu windows-x64-msvc; do
-            case "$asset" in macos-*) ext=tar.gz ;; *) ext=zip ;; esac
-            src="dist/mimalloc-pprof-${asset}.${ext}"
-            if [ ! -f "$src" ]; then
-              echo "::error::${src} was not produced by build-binaries; refusing to cut a release missing the ${asset} asset"
-              ls -l dist
-              exit 1
-            fi
-            mv "$src" "dist/mimalloc-pprof-${asset}-${tag}.${ext}"
-          done
-          count=$(ls dist | wc -l)
-          if [ "$count" -ne 5 ]; then
-            echo "::error::expected exactly 5 release assets, found ${count}"
-            ls -l dist
-            exit 1
-          fi
-          ls -l dist
-
-      - name: Collate exact asset hashes and release-level info.json
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ inputs.issue_number }}
-          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
-        run: python3 ci/release.py preflight-artifacts --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" --dist dist
-
-      - name: Upload release preflight record
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-preflight-${{ inputs.candidate_sha }}
-          path: dist/
-          if-no-files-found: error
 
       - name: Authenticate with crates.io
         if: env.IS_DRY_RUN != 'true'
@@ -753,12 +751,10 @@ jobs:
             dist/mimalloc-pprof-windows-x64-gnu-${{ steps.tag.outputs.tag }}.zip
             dist/mimalloc-pprof-windows-x64-msvc-${{ steps.tag.outputs.tag }}.zip
 
-  # Dry-run pretag evidence from the actual packaged libraries. Publication remains
-  # fail-closed above; before enabling it, move this gate ahead of all release writes.
+  # Both dry and real attempts smoke the exact archived library before any release write.
   smoke-shipped-assets:
     name: Smoke shipped archive (${{ matrix.asset }})
-    if: inputs.dry_run == true
-    needs: [release]
+    needs: [preflight-assets]
     strategy:
       fail-fast: false
       matrix:
@@ -826,7 +822,7 @@ jobs:
 
   record-attempt-outcome:
     name: Record release attempt outcome on issue
-    needs: [validate-attempt, build-and-package, build-binaries, test-shipped-assets, release, smoke-shipped-assets]
+    needs: [validate-attempt, build-and-package, build-binaries, test-shipped-assets, preflight-assets, smoke-shipped-assets, release]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -845,20 +841,21 @@ jobs:
           PACKAGE: ${{ needs.build-and-package.result }}
           BINARIES: ${{ needs.build-binaries.result }}
           TEST_SHIPPED: ${{ needs.test-shipped-assets.result }}
+          PREFLIGHT: ${{ needs.preflight-assets.result }}
           RELEASE: ${{ needs.release.result }}
           SMOKE: ${{ needs.smoke-shipped-assets.result }}
           IS_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           state=blocked
-          if [[ "$VALIDATE" == success && "$PACKAGE" == success && "$BINARIES" == success && "$TEST_SHIPPED" == success && "$RELEASE" == success ]]; then
-            if [[ "$IS_DRY_RUN" == true && "$SMOKE" == success ]]; then
+          if [[ "$VALIDATE" == success && "$PACKAGE" == success && "$BINARIES" == success && "$TEST_SHIPPED" == success && "$PREFLIGHT" == success && "$SMOKE" == success && "$RELEASE" == success ]]; then
+            if [[ "$IS_DRY_RUN" == true ]]; then
               state=dry-passed
             elif [[ "$IS_DRY_RUN" != true ]]; then
               state=real-passed
             fi
           fi
-          results="validate=$VALIDATE,package=$PACKAGE,binaries=$BINARIES,test-shipped=$TEST_SHIPPED,release=$RELEASE,smoke=$SMOKE"
+          results="validate=$VALIDATE,package=$PACKAGE,binaries=$BINARIES,test-shipped=$TEST_SHIPPED,preflight=$PREFLIGHT,smoke=$SMOKE,release=$RELEASE"
           python3 ci/release.py record-outcome --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" \
             --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --state "$state" --results "$results"

@@ -593,10 +593,11 @@ def main() -> int:
                 "--state", choices=("dry-passed", "blocked", "real-passed"), required=True
             )
             entry.add_argument("--results", required=True)
-    preflight = commands.add_parser("preflight-artifacts")
-    preflight.add_argument("--issue", type=int, default=444)
-    preflight.add_argument("--candidate-sha", required=True)
-    preflight.add_argument("--dist", type=Path, required=True)
+    for operation in ("preflight-artifacts", "verify-artifacts"):
+        artifact_command = commands.add_parser(operation)
+        artifact_command.add_argument("--issue", type=int, default=444)
+        artifact_command.add_argument("--candidate-sha", required=True)
+        artifact_command.add_argument("--dist", type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.operation == "status":
@@ -606,16 +607,22 @@ def main() -> int:
             return 0
         candidate = args.candidate_sha or command("git", "rev-parse", "HEAD")
         value = directive(args.issue, source_version(), candidate)
-        if args.operation == "preflight-artifacts":
+        if args.operation in ("preflight-artifacts", "verify-artifacts"):
             existing = issue_directives(args.issue)
             if not existing:
                 raise ReleaseError("issue has no release directive")
             frozen = frozen_identity(args.issue)
             require_history(existing, value, frozen)
-            info = inspect_artifacts(args.dist, value)
+            if args.operation == "preflight-artifacts":
+                info = inspect_artifacts(args.dist, value)
+            else:
+                info = json.loads((args.dist / "info.json").read_text())
             if frozen is not None:
                 require_frozen_info(frozen, value, info)
-            (args.dist / "info.json").write_text(json.dumps(info, indent=2, sort_keys=True) + "\n")
+            if args.operation == "preflight-artifacts":
+                (args.dist / "info.json").write_text(
+                    json.dumps(info, indent=2, sort_keys=True) + "\n"
+                )
             verify_info(args.dist, value, info)
             print(json.dumps(info, indent=2))
             return 0

@@ -21,6 +21,8 @@ class FakeDestination:
         self.events: list[str] = []
         self.upload_failures = 0
         self.ambiguous_writes: set[str] = set()
+        self.freeze_visible = True
+        self.release_target_is_tag = False
 
     def maybe_ambiguous(self, name: str) -> None:
         if name in self.ambiguous_writes:
@@ -32,7 +34,11 @@ class FakeDestination:
 
     def release(self, tag: str) -> rd.ReleaseState | None:
         return (
-            rd.ReleaseState(self.tag or "", self.draft, self.assets.copy())
+            rd.ReleaseState(
+                tag if self.release_target_is_tag else self.tag or "",
+                self.draft,
+                self.assets.copy(),
+            )
             if self.draft is not None
             else None
         )
@@ -43,6 +49,9 @@ class FakeDestination:
     def freeze(self, record: dict[str, object]) -> None:
         self.frozen = record
         self.events.append("freeze")
+
+    def read_freeze(self) -> dict[str, object] | None:
+        return self.frozen if self.freeze_visible else None
 
     def create_tag(self, tag: str, sha: str) -> None:
         self.tag = sha
@@ -136,6 +145,21 @@ class DestinationTests(unittest.TestCase):
         self.run_worker()
         self.assertNotIn("crate", self.backend.events)
         self.assertIn("finalize", self.backend.events)
+
+    def test_freeze_must_be_visible_before_first_destination_write(self) -> None:
+        self.backend.freeze_visible = False
+        with self.assertRaisesRegex(release.ReleaseError, "freeze readback"):
+            self.run_worker()
+        self.assertEqual(self.backend.events, ["freeze"])
+
+    def test_release_targeting_resolved_tag_can_resume(self) -> None:
+        self.run_worker()
+        self.backend.release_target_is_tag = True
+        self.run_worker(self.backend.frozen)
+        self.assertEqual(self.backend.events.count("tag"), 1)
+        self.backend.tag = "b" * 40
+        with self.assertRaisesRegex(release.ReleaseError, "immutable tag"):
+            self.run_worker(self.backend.frozen)
 
     def test_lost_success_responses_are_verified_without_duplicate_writes(self) -> None:
         self.backend.ambiguous_writes = {
