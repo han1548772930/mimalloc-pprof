@@ -6,11 +6,9 @@ failure once already. These tests are the substitute for a CI run: they assert t
 the workflow has to have, from the YAML itself.
 
 What they check:
-  * no non-Linux runner anywhere (the owner requirement that macOS never runs natively is
-    enforced repository-wide by ci/lint_no_macos_runners.py; this adds "and nothing here
-    runs on Windows either, because every shipped binary is cross-built");
+  * build and publication stay on Linux; the release-local test gate runs on native hosts;
   * `release` waits for every job that produces one of its assets;
-  * every artifact a build job uploads is actually downloaded by `release`;
+  * shipped artifacts are downloaded by `release`; test bundles by the native gate;
   * the release's `files:` list, the rename step and the build matrix all name the same
     set of assets -- three places that have to agree and no compiler to check them;
   * every cross lane names a toolchain file that exists.
@@ -63,8 +61,10 @@ class AutoReleaseStructureTests(unittest.TestCase):
     def jobs(self) -> dict[str, Any]:
         return cast(dict[str, Any], self.doc["jobs"])
 
-    def test_every_job_runs_on_linux(self) -> None:
+    def test_build_and_publication_jobs_run_on_linux(self) -> None:
         for name, job in self.jobs().items():
+            if name in ("smoke-shipped-assets", "test-shipped-assets"):
+                continue
             runs_on = job.get("runs-on")
             self.assertEqual(
                 runs_on,
@@ -81,12 +81,42 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 "platform is chosen by the cross toolchain now, not by the runner",
             )
 
-    def test_release_waits_for_every_build_job(self) -> None:
+    def test_publication_waits_for_archive_collation_and_both_native_gates(self) -> None:
         release = self.jobs()["release"]
-        needs = release["needs"]
-        self.assertIsInstance(needs, list)
-        self.assertIn("build-and-package", needs)
-        self.assertIn("build-binaries", needs)
+        preflight = self.jobs()["preflight-assets"]
+        smoke = self.jobs()["smoke-shipped-assets"]
+        self.assertEqual(
+            sorted(preflight["needs"]),
+            ["build-and-package", "build-binaries", "test-shipped-assets"],
+        )
+        self.assertEqual(smoke["needs"], ["preflight-assets"])
+        self.assertEqual(sorted(release["needs"]), ["preflight-assets", "smoke-shipped-assets"])
+
+    def test_release_test_gate_uses_all_native_hosts_and_exact_bytes(self) -> None:
+        gate = self.jobs()["test-shipped-assets"]
+        self.assertEqual(gate["needs"], ["build-binaries"])
+        self.assertEqual(gate["runs-on"], "${{ matrix.runner }}")
+        self.assertEqual(
+            {row["asset"]: row["runner"] for row in gate["strategy"]["matrix"]["include"]},
+            {
+                "macos-arm64": "macos-15",
+                "macos-x86_64": "macos-15-intel",
+                "windows-x64-gnu": "windows-latest",
+                "windows-x64-msvc": "windows-latest",
+            },
+        )
+        script = job_run_text(gate)
+        self.assertIn("ci/verify_release_test_bundle.py", script)
+        self.assertIn("ci/run_test_bundle.py", script)
+        downloads = [
+            step["with"]["name"]
+            for step in gate["steps"]
+            if str(step.get("uses", "")).startswith("actions/download-artifact")
+        ]
+        self.assertEqual(
+            downloads,
+            ["release-binaries-${{ matrix.asset }}", "release-test-bundle-${{ matrix.asset }}"],
+        )
 
     def test_release_outcome_reports_every_build_job(self) -> None:
         outcome = self.jobs()["release-outcome"]
@@ -108,17 +138,17 @@ class AutoReleaseStructureTests(unittest.TestCase):
             toolchain = ROOT / "cmake" / "toolchains" / f"soldr-{triple}.cmake"
             self.assertTrue(toolchain.is_file(), f"missing {toolchain}")
 
-    def test_every_uploaded_artifact_is_downloaded_by_release(self) -> None:
+    def test_archive_inputs_are_collated_then_exact_result_reaches_release(self) -> None:
         uploaded: set[str] = set()
         for name, job in self.jobs().items():
-            if name == "release":
+            if name in ("release", "smoke-shipped-assets"):
                 continue
             for step in job.get("steps", []):
                 if str(step.get("uses", "")).startswith("actions/upload-artifact"):
                     uploaded.add(str(step["with"]["name"]))
         downloaded: set[str] = set()
         patterns: list[str] = []
-        for step in self.jobs()["release"]["steps"]:
+        for step in self.jobs()["preflight-assets"]["steps"]:
             if str(step.get("uses", "")).startswith("actions/download-artifact"):
                 with_ = cast(dict[str, Any], step["with"])
                 if "name" in with_:
@@ -126,14 +156,63 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 if "pattern" in with_:
                     patterns.append(str(with_["pattern"]))
         for artifact in uploaded:
+            if artifact.startswith(("release-preflight-", "release-test-bundle-")):
+                continue
             covered = artifact in downloaded or any(
                 artifact.startswith(pattern.rstrip("*")) for pattern in patterns
             )
             self.assertTrue(
                 covered,
-                f"artifact {artifact!r} is uploaded but never downloaded by `release`; it "
+                f"artifact {artifact!r} is uploaded but never downloaded by `preflight-assets`; it "
                 "would not reach the GitHub Release",
             )
+        release_downloads = [
+            step["with"]["name"]
+            for step in self.jobs()["release"]["steps"]
+            if str(step.get("uses", "")).startswith("actions/download-artifact")
+        ]
+        self.assertEqual(release_downloads, ["release-preflight-${{ inputs.candidate_sha }}"])
+        self.assertIn("ci/release.py verify-artifacts", job_run_text(self.jobs()["release"]))
+
+    def test_every_attempt_smokes_shipped_archives_before_publication(self) -> None:
+        smoke = self.jobs()["smoke-shipped-assets"]
+        self.assertNotIn("if", smoke)
+        self.assertEqual(smoke["needs"], ["preflight-assets"])
+        self.assertIn("smoke-shipped-assets", self.jobs()["release"]["needs"])
+        self.assertEqual(
+            {row["asset"]: row["runner"] for row in smoke["strategy"]["matrix"]["include"]},
+            {
+                "macos-arm64": "macos-15",
+                "macos-x86_64": "macos-15-intel",
+                "windows-x64-gnu": "windows-latest",
+                "windows-x64-msvc": "windows-latest",
+            },
+        )
+        steps = smoke["steps"]
+        self.assertEqual(steps[0]["with"]["ref"], "${{ inputs.candidate_sha }}")
+        self.assertEqual(steps[1]["with"]["python-version"], "3.12")
+        self.assertEqual(steps[2]["with"]["name"], "release-preflight-${{ inputs.candidate_sha }}")
+        self.assertIn('"$(git rev-parse HEAD)" = "$CANDIDATE_SHA"', steps[3]["run"])
+        self.assertIn("ci/smoke_release_archive.py", steps[3]["run"])
+        self.assertIn('--asset "$ASSET"', steps[3]["run"])
+
+    def test_recorded_dry_success_waits_for_native_smoke(self) -> None:
+        record = self.jobs()["record-attempt-outcome"]
+        self.assertIn("smoke-shipped-assets", record["needs"])
+        self.assertIn("test-shipped-assets", record["needs"])
+        step = next(step for step in record["steps"] if "record-outcome" in step.get("run", ""))
+        self.assertEqual(step["env"]["SMOKE"], "${{ needs.smoke-shipped-assets.result }}")
+        self.assertEqual(step["env"]["TEST_SHIPPED"], "${{ needs.test-shipped-assets.result }}")
+        script = step["run"]
+        self.assertIn('"$SMOKE" == success', script)
+        self.assertIn('"$TEST_SHIPPED" == success', script)
+        self.assertIn("smoke=$SMOKE", script)
+        self.assertIn("state=dry-passed", script)
+        self.assertIn("state=real-passed", script)
+        self.assertEqual(
+            self.jobs()["release-outcome"]["needs"],
+            ["build-and-package", "build-binaries", "release"],
+        )
 
     def test_release_files_rename_and_matrix_agree(self) -> None:
         release = self.jobs()["release"]
@@ -146,7 +225,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
         files = [line for line in files if line]
         # The architecture-independent amalgamation ZIP plus one archive per cross lane.
         self.assertEqual(len(files), 1 + len(EXPECTED_LANES), files)
-        rename_text = job_run_text(release)
+        rename_text = job_run_text(self.jobs()["preflight-assets"])
         for asset, (_, ext) in EXPECTED_LANES.items():
             attached = [f for f in files if f"mimalloc-pprof-{asset}-" in f]
             self.assertEqual(
@@ -183,19 +262,16 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 )
             ):
                 self.assertEqual(step.get("if"), "env.IS_DRY_RUN != 'true'", source)
-        tag_step = next(
+        tag_step = next(step for step in steps if step.get("name") == "Determine release tag")
+        tag_script = tag_step["run"]
+        self.assertIn('echo "tag=v${version}"', tag_script)
+        self.assertNotIn("git tag", tag_script)
+        gh_release = next(
             step
             for step in steps
-            if step.get("name") == "Determine artifact suffix and release tag"
+            if str(step.get("uses", "")).startswith("softprops/action-gh-release")
         )
-        tag_script = tag_step["run"]
-        self.assertIn('if [ "$IS_DRY_RUN" = "true" ]; then', tag_script)
-        dry_branch = tag_script.split('if [ "$IS_DRY_RUN" = "true" ]; then', 1)[1].split("else", 1)[
-            0
-        ]
-        self.assertIn("suffix=$(git rev-parse HEAD)", dry_branch)
-        self.assertNotIn("tag=", dry_branch)
-        self.assertIn("steps.tag.outputs.suffix", job_run_text(release))
+        self.assertEqual(gh_release["with"]["tag_name"], "${{ steps.tag.outputs.tag }}")
         self.assertIn(
             "soldr cargo publish --dry-run -p mimalloc-pprof --locked",
             job_run_text(release),
@@ -210,9 +286,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
         self.assertIn("full_run_id", inputs)
         release = self.jobs()["release"]
         tag_step = next(
-            step
-            for step in release["steps"]
-            if step.get("name") == "Determine artifact suffix and release tag"
+            step for step in release["steps"] if step.get("name") == "Determine release tag"
         )
         self.assertNotIn("GITHUB_REF_NAME", tag_step["run"])
         gate = next(
@@ -247,7 +321,7 @@ class AutoReleaseStructureTests(unittest.TestCase):
                 for step in job["steps"]
                 if str(step.get("uses", "")).startswith("actions/checkout")
             )
-            self.assertEqual(checkout["with"]["ref"], "${{ inputs.candidate_sha || github.sha }}")
+            self.assertEqual(checkout["with"]["ref"], "${{ inputs.candidate_sha }}")
         release_checkout = next(
             step
             for step in release["steps"]

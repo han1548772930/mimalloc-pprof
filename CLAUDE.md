@@ -1,5 +1,12 @@
 # mimalloc-pprof — agent guidance
 
+> [!IMPORTANT]
+> Ordinary PR/main CI is fractional. Add `ci-full` to a PR for every supported
+> platform; a release needs the full matrix on the exact merged commit SHA.
+> Start or resume the issue-driven release attempt through `ci/release.py`.
+> Read [docs/release-process.md](docs/release-process.md) before changing release
+> workflows or trying to tag, publish, or dispatch a release.
+
 Fork of microsoft/mimalloc adding pprof-compatible sampled heap profiling (Windows-first)
 plus Rust crates in `rust/`. **All design decisions and work orders live in GitHub issues —
 start at issue #2 (the epic), which links the ordered sub-issues.**

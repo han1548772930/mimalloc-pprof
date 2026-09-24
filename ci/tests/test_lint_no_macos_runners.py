@@ -98,6 +98,30 @@ class LintNoMacosRunnersTests(unittest.TestCase):
             )
         )
 
+    def test_release_smoke_exception_requires_prewrite_dag(self) -> None:
+        from copy import deepcopy
+
+        path = WORKFLOWS / "auto-release.yml"
+        workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+        offenders = list(lint.offenders(workflow))
+        smoke_rows = [
+            row for row in offenders if row[0] == "jobs.smoke-shipped-assets.strategy.matrix"
+        ]
+        self.assertEqual(len(smoke_rows), 2)
+        self.assertTrue(all(lint.allowed_full_runner(path, workflow, *row) for row in smoke_rows))
+
+        for job_name, key, value in (
+            ("smoke-shipped-assets", "needs", ["release"]),
+            ("smoke-shipped-assets", "if", "inputs.dry_run == true"),
+            ("release", "needs", ["preflight-assets"]),
+        ):
+            weakened = deepcopy(workflow)
+            weakened["jobs"][job_name][key] = value
+            self.assertTrue(
+                all(not lint.allowed_full_runner(path, weakened, *row) for row in smoke_rows),
+                f"weakening {job_name}.{key} should revoke the hosted Mac allowance",
+            )
+
     def test_the_inherited_azure_pipeline_is_scanned_and_clean(self) -> None:
         """It carried macOS-14/macOS-15 jobs; a lint that skipped it would call that clean."""
         self.assertTrue(AZURE.exists())
