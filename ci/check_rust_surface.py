@@ -11,9 +11,10 @@ and the new API is simply invisible to every Rust consumer. That is how
 `include/mimalloc/memory-events.h` ended up with no binding at all while the profiler
 next to it was bound completely.
 
-Worse than absent is *wrong*. `mi_option_t` is positional, and this fork inserts thirteen
-enumerators (`prof*`, `memory_events`, `purge_zeroes`, `scavenger`, `purge_holes*`) at
-indices 47..=59, ahead of `_mi_option_last`. A mirror that drifted by one would compile,
+Worse than absent is *wrong*. `mi_option_t` is positional, and this fork inserts fourteen
+enumerators (`prof*`, `memory_events`, `purge_zeroes`, `scavenger`, `purge_holes*`,
+`purge_rearm`) at
+indices 47..=60, ahead of `_mi_option_last`. A mirror that drifted by one would compile,
 link, run, and set a different option than the caller named, silently and forever. So
 this script does not merely check that each option NAME is present: it checks the whole
 sequence, in order, against the header.

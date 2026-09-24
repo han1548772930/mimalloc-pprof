@@ -457,9 +457,10 @@ pub type mi_memory_allocation_visit_fun =
 
 /// Mirrors `mi_option_t` (include/mimalloc.h).
 ///
-/// **Positional, and silently wrong if it drifts.** This fork inserts thirteen
+/// **Positional, and silently wrong if it drifts.** This fork inserts fourteen
 /// enumerators (`mi_option_prof*`, `mi_option_memory_events`, `mi_option_purge_zeroes`,
-/// `mi_option_scavenger`, `mi_option_purge_holes*`) at indices 47..=59, immediately
+/// `mi_option_scavenger`, `mi_option_purge_holes*`, `mi_option_purge_rearm`) at indices
+/// 47..=60, immediately
 /// before `_mi_option_last` -- so a mirror copied from upstream mimalloc would set a
 /// *different* option than the caller named, with no diagnostic. Every value below is
 /// checked against the C enum at test time by `tests/t19_layout.rs`, and the ordering is
@@ -613,8 +614,14 @@ mi_options! {
     /// 1 = pages, 2 = pages + per-block free maps. Path from `MIMALLOC_SNAPSHOT_PATH`, else
     /// `mimalloc-snapshot.<pid>.bin`.
     mi_option_snapshot_on_exit = 60;
+    /// **Fork addition (#457).** Re-arm an orphaned `subproc->purge_expire` so the *deferred*
+    /// arena purge actually runs on schedule and `purge_delay` takes effect: 0 = off (default),
+    /// 1 = on. Off by default because making the deferred purge run returns more free arena
+    /// memory but re-faults memory the workload is about to reuse; see issue #457 for the
+    /// measured peak/throughput curve.
+    mi_option_purge_rearm = 61;
     /// Sentinel: one past the last real option.
-    _mi_option_last = 61;
+    _mi_option_last = 62;
 }
 
 /// `MI_SNAPSHOT_BLOCKS` (include/mimalloc.h, #338): include per-block free bitmaps for the
