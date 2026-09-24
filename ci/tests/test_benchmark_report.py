@@ -1493,15 +1493,14 @@ class BenchmarkReportTests(unittest.TestCase):
         # #210 dropped the unlabeled throughput/history PNG stubs from the
         # README: only charts with real axes, legend, and values are embedded.
         # The headline numbers stay live dashboard links instead.
-        expected = {
-            name: "https://zackees.github.io/mimalloc-pprof/#scaling"
-            for name in report.SCALING_PANELS.values()
-        }
+        expected = dict.fromkeys(
+            report.SCALING_PANELS.values(), "https://zackees.github.io/mimalloc-pprof/#scaling"
+        )
         expected.update(
-            {
-                name: "https://zackees.github.io/mimalloc-pprof/#requested-size-distributions"
-                for name in report.DISTRIBUTION_PANELS.values()
-            }
+            dict.fromkeys(
+                report.DISTRIBUTION_PANELS.values(),
+                "https://zackees.github.io/mimalloc-pprof/#requested-size-distributions",
+            )
         )
         for image, destination in expected.items():
             raw = (
