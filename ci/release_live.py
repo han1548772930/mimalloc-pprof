@@ -182,6 +182,7 @@ def crate_publish_metadata(path: Path) -> dict[str, object]:
     if path.name != f"{name}-{version}.crate":
         raise release.ReleaseError("packaged crate version differs from Cargo metadata")
     with tarfile.open(path, "r:gz") as archive:
+
         def member_bytes(member_name: str) -> bytes:
             try:
                 member = archive.getmember(f"{name}-{version}/{member_name}")
@@ -220,7 +221,9 @@ def crate_publish_metadata(path: Path) -> dict[str, object]:
     if package["features"] != manifest.get("features", {}):
         raise release.ReleaseError("packaged crate features differ from Cargo metadata")
     if "target" in manifest:
-        raise release.ReleaseError("target-specific crate dependencies need explicit publish mapping")
+        raise release.ReleaseError(
+            "target-specific crate dependencies need explicit publish mapping"
+        )
     packaged_deps: dict[tuple[str, str], Any] = {}
     for section, kind in (
         ("dependencies", "normal"),
