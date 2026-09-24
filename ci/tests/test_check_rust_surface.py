@@ -31,7 +31,7 @@ class CheckRustSurfaceTests(unittest.TestCase):
         header = (surface.INCLUDE_DIR / "mimalloc.h").read_text(encoding="utf-8")
         options = surface.option_enumerators(header)
         self.assertEqual(options[-1], "_mi_option_last")
-        # The thirteen this fork inserts, contiguously, ahead of the sentinel.
+        # The fourteen this fork inserts, contiguously, ahead of the sentinel.
         fork_block = [
             "mi_option_prof",
             "mi_option_prof_sample_rate",
@@ -47,6 +47,7 @@ class CheckRustSurfaceTests(unittest.TestCase):
             "mi_option_purge_holes_min_interval",
             "mi_option_purge_holes_full_every",
             "mi_option_snapshot_on_exit",
+            "mi_option_purge_rearm",
         ]
         self.assertEqual(options[-len(fork_block) - 1 : -1], fork_block)
 
