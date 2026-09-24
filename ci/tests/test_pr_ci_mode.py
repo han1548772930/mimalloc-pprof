@@ -1,5 +1,7 @@
 """External CI must follow effective permission, not fork or author history."""
 
+# pyright: reportMissingTypeStubs=false
+
 import json
 import sys
 import urllib.error
