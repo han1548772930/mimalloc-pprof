@@ -2009,6 +2009,29 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-thread-idle-rss PROPERTIES TIMEOUT 120)
   endif()
 
+  # test-arena-purge-rearm (#457): the DEFERRED arena purge, as opposed to the idle hook
+  # test-thread-idle-rss covers. Its worker frees its large blocks and then only idles -- no
+  # `mi_on_thread_idle`, no collect, no allocation -- so the memory can come back only if the
+  # scavenger's `purge_delay` deadline is really armed. The two ENVIRONMENT entries ARE the
+  # test's preconditions: `MIMALLOC_PURGE_REARM=1` is the fix under test, and the 20 ms delay
+  # is what makes the deadline observable inside the process's own lifetime. Plain C and
+  # public API only, so it also compiles against a tree that has never heard of the option --
+  # which is what lets this same TU serve as the RED half of the demonstration in #457.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-purge-rearm test/test-arena-purge-rearm.c)
+    target_compile_definitions(mimalloc-test-arena-purge-rearm PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-purge-rearm PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-purge-rearm PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-purge-rearm PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-arena-purge-rearm PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-arena-purge-rearm COMMAND mimalloc-test-arena-purge-rearm)
+    set_tests_properties(test-arena-purge-rearm PROPERTIES TIMEOUT 120
+      ENVIRONMENT "MIMALLOC_PURGE_REARM=1;MIMALLOC_PURGE_DELAY=20")
+  endif()
+
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of
   # docs/purge-all-implementation.md §11 (T1-T3, G1-G8, C1-C2) in one binary that is built for
   # BOTH MI_PPROF and BOTH MI_OWNER_GATE settings and branches on `#if MI_OWNER_GATE` for its
@@ -2213,7 +2236,9 @@ endif()
 #
 #   * process-wide peak RSS / current RSS -- test-memory-gate (the committed baselines are
 #     min-of-8 peak RSS), test-degenerate (RSS must not grow per iteration),
-#     test-process-rss and test-thread-idle-rss (RSS must fall after a thread idles).
+#     test-process-rss and test-thread-idle-rss (RSS must fall after a thread idles),
+#     test-arena-purge-rearm (RSS must fall after the scavenger's `purge_delay` deadline, with
+#     no idle hook to help it).
 #     Under memory pressure from a parallel wave the kernel's reclaim decisions, not the
 #     allocator's, decide those numbers.
 #   * a wall-clock deadline -- test-park-handoff* wait a bounded time for a hole sweep to
@@ -2253,6 +2278,11 @@ set(mi_serial_tests
   test-degenerate
   test-process-rss
   test-thread-idle-rss
+  # #457: same class as the two above -- it asserts on process-wide current RSS falling after
+  # a worker hands memory back. It waits on the SCAVENGER's paced deadline rather than the
+  # idle hook, so a parallel wave's memory pressure (or its extra scavenger activity) can move
+  # the number independently of the allocator.
+  test-arena-purge-rearm
   test-park-handoff
   test-park-handoff-no-scavenger
   test-park-handoff-eager
