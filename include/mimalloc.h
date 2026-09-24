@@ -677,6 +677,8 @@ typedef enum mi_option_e {
   mi_option_purge_holes_min_interval,   // do not sweep one thread's heaps more often than every N milli-seconds (=100)
   mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
+  mi_option_purge_rearm,                // re-arm an orphaned `subproc->purge_expire` so the DEFERRED arena purge runs on schedule and `purge_delay` takes effect (=0, #457).
+                                        // Off by default: with it on the purge actually runs, which returns more free arena memory but measurably costs throughput.
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
