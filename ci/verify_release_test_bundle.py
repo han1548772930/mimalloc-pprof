@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import tarfile
 from pathlib import Path
 from typing import cast
@@ -43,7 +44,29 @@ def verify(archive: Path, bundle: Path, asset: str) -> None:
         raise ReleaseError(f"unknown release asset {asset}")
 
     with tarfile.open(bundle, "r:gz") as tar:
-        rows = {row.name.removeprefix("./"): row for row in tar.getmembers() if row.isfile()}
+        rows: dict[str, tarfile.TarInfo] = {}
+        root_seen = False
+        for row in tar.getmembers():
+            raw = row.name
+            if raw == "." and row.isdir():
+                if root_seen:
+                    raise ReleaseError(f"duplicate test bundle member {raw}")
+                root_seen = True
+                continue
+            name = raw.removeprefix("./")
+            if (
+                not name
+                or name.startswith("/")
+                or "\\" in name
+                or re.match(r"^[A-Za-z]:", name)
+                or any(part in ("", ".", "..") for part in name.rstrip("/").split("/"))
+                or not (row.isfile() or row.isdir())
+            ):
+                raise ReleaseError(f"unsafe test bundle member {raw}")
+            if row.isfile():
+                if name in rows:
+                    raise ReleaseError(f"duplicate test bundle member {raw}")
+                rows[name] = row
         manifest = rows.get("tests.json")
         if manifest is None:
             raise ReleaseError("test bundle has no tests.json")
