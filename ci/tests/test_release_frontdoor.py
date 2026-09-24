@@ -45,8 +45,9 @@ class ReleaseFrontdoorTests(unittest.TestCase):
                 ],
             )
         )
-        with patch.object(release, "command", return_value=response):
+        with patch.object(release, "command", return_value=response) as run:
             self.assertEqual(release.issue_comments(444), ["owner\nbody", "automation"])
+        self.assertIn("| @json", run.call_args.args[-1])
 
     def test_issue_comment_read_accepts_valid_empty_page(self) -> None:
         with patch.object(release, "command", return_value="[]"):
