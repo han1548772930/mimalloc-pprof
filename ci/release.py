@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Issue-driven, SHA-pinned release entry point for mimalloc-pprof (#444).
 
-The real publisher remains disabled in auto-release.yml until the destination
-state machine is implemented. This front door only records an attempt and
-dispatches a non-publishing worker.
+Start/resume dispatch a non-publishing worker. A real workflow dispatch uses
+the same issue directive and the frozen destination worker in release_live.py.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ import hashlib
 import json
 import posixpath
 import re
+import stat
 import struct
 import subprocess
 import sys
@@ -326,6 +326,8 @@ def validate_candidate(
     *,
     require_registry_free: bool = True,
     frozen: dict[str, Any] | None = None,
+    allow_release_outputs: bool = False,
+    require_issue_ready: bool = False,
 ) -> None:
     expected = directive(value["issue"], value["version"], value["candidate_sha"])
     require_same_directive(expected, value)
@@ -337,6 +339,8 @@ def validate_candidate(
     if issue.get("state") != "OPEN" or f"v{value['version']}" not in issue.get("title", ""):
         raise ReleaseError("release issue is closed or targets a different version")
     body = issue.get("body", "")
+    if require_issue_ready and not re.search(r"(?m)^- State: \*\*ready-to-publish\*\*\.", body):
+        raise ReleaseError("release issue is not in ready-to-publish state")
     bump = recorded_version_bump_sha(body)
     if merged_pr_sha(recorded_version_bump_pr(body)) != bump:
         raise ReleaseError("version bump differs from its recorded PR merge")
@@ -363,7 +367,10 @@ def validate_candidate(
     bumped_version = re.search(r'(?m)^version\s*=\s*"([^"]+)"', bumped)
     if not bumped_version or bumped_version.group(1) != value["version"]:
         raise ReleaseError("recorded bump has the wrong version")
-    if command("git", "status", "--porcelain"):
+    status_rows = command("git", "status", "--porcelain").splitlines()
+    if allow_release_outputs:
+        status_rows = [row for row in status_rows if row not in ("?? dist/", "?? release-crate/")]
+    if status_rows:
         raise ReleaseError("release candidate checkout must be clean")
     existing_tag = command("git", "ls-remote", "--tags", "origin", f"refs/tags/{value['tag']}")
     if existing_tag:
@@ -403,12 +410,21 @@ def archive_members(path: Path) -> dict[str, bytes]:
         if path.name.endswith(".zip"):
             with zipfile.ZipFile(path) as archive:
                 total = 0
+                seen_zip_names: set[str] = set()
                 for row in archive.infolist():
+                    if row.filename in seen_zip_names:
+                        raise ReleaseError(f"duplicate archive member {row.filename}")
+                    seen_zip_names.add(row.filename)
                     total += row.file_size
+                    unix_type = (
+                        stat.S_IFMT(row.external_attr >> 16) if row.create_system == 3 else 0
+                    )
                     if (
                         row.file_size > MAX_ASSET_BYTES
                         or total > MAX_ASSET_BYTES
-                        or (row.external_attr >> 16) & 0o170000 == 0o120000
+                        or unix_type not in (0, stat.S_IFREG, stat.S_IFDIR)
+                        or (unix_type == stat.S_IFREG and row.is_dir())
+                        or (unix_type == stat.S_IFDIR and not row.is_dir())
                     ):
                         raise ReleaseError(f"invalid archive member {row.filename}")
                     entries.append(

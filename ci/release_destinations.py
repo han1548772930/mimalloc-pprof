@@ -1,12 +1,9 @@
-"""Dry release destination planner and testable publication state machine.
-
-No live destination adapter is supplied here. auto-release.yml keeps its real
-publication gate closed until the exact-SHA pilot has been reviewed.
-"""
+"""Issue-frozen release destination planner and resumable publisher."""
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import subprocess
@@ -25,6 +22,13 @@ class TransientGitHubError(Exception):
     """A retryable transport or GitHub server failure (not a conflict)."""
 
 
+class AmbiguousCratePublishError(release.ReleaseError):
+    """The registry may have accepted the crate before the response was lost."""
+
+
+MAX_CRATE_BYTES = 10_000_000  # crates.io's compressed .crate upload limit
+
+
 class ReadableDestination(Protocol):
     def tag_sha(self, tag: str) -> str | None: ...
     def release(self, tag: str) -> ReleaseState | None: ...
@@ -32,6 +36,7 @@ class ReadableDestination(Protocol):
 
 
 class Destination(ReadableDestination, Protocol):
+    def validate_crate(self, path: Path) -> None: ...
     def freeze(self, record: dict[str, object]) -> None: ...
     def read_freeze(self) -> dict[str, object] | None: ...
     def create_tag(self, tag: str, sha: str) -> None: ...
@@ -118,6 +123,10 @@ class ReadOnlyDestination:
             if error.code == 404:
                 return None
             raise release.ReleaseError(f"crates.io returned HTTP {error.code}") from error
+        except urllib.error.URLError as error:
+            raise release.ReleaseError(f"crates.io read failed: {error}") from error
+        if data.get("version", {}).get("yanked"):
+            raise release.ReleaseError("crates.io version is yanked")
         return str(data["version"]["checksum"])
 
 
@@ -170,11 +179,17 @@ def preflight(
 ) -> Plan:
     """Inspect every destination and byte before any write, including a freeze."""
     release.verify_info(dist, directive, info)
+    version = str(directive["version"])
+    if crate.name != f"mimalloc-pprof-{version}.crate" or crate.is_symlink():
+        raise release.ReleaseError("packaged crate name or file type differs from directive")
+    crate_size = crate.stat().st_size
+    if crate_size <= 0 or crate_size > MAX_CRATE_BYTES:
+        raise release.ReleaseError("packaged crate exceeds crates.io 10 MB limit or is empty")
     crate_hash = file_sha256(crate)
     record = release.freeze_record(directive, info, crate_hash)
     if frozen is not None and frozen != record:
         raise release.ReleaseError("issue freeze differs from exact packaged bytes")
-    tag, sha, version = (str(directive[key]) for key in ("tag", "candidate_sha", "version"))
+    tag, sha = (str(directive[key]) for key in ("tag", "candidate_sha"))
     existing_tag = destination.tag_sha(tag)
     if existing_tag is not None and existing_tag != sha:
         raise release.ReleaseError("immutable tag points to another candidate")
@@ -223,6 +238,13 @@ def github_retry(
         try:
             operation()
             return
+        except release.ReleaseError:
+            # A second attempt may report 422 because the first request committed
+            # while its response was lost. Reconcile exact state before failing.
+            if completed is not None and completed():
+                log("github: verified write after conflict response")
+                return
+            raise
         except TransientGitHubError as error:
             log(f"github transient attempt={attempt}/10: {error}")
             # The server may have committed the write before the response failed.
@@ -245,8 +267,9 @@ def execute(
     log: Callable[[str], None],
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Run a frozen plan with an injected destination; no live adapter exists."""
+    """Freeze, transfer from one runner, verify all bytes, then publish the draft."""
     plan = preflight(destination, directive, info, dist, crate, frozen)
+    destination.validate_crate(crate)
     tag, sha = str(directive["tag"]), str(directive["candidate_sha"])
     expected_assets = cast(dict[str, str], plan.freeze["asset_sha256"])
 
@@ -282,7 +305,12 @@ def execute(
         return digest == expected_assets[name]
 
     if frozen is None:
-        destination.freeze(plan.freeze)
+        github_retry(
+            lambda: destination.freeze(plan.freeze),
+            log=log,
+            completed=lambda: destination.read_freeze() == plan.freeze,
+            sleep=sleep,
+        )
     authoritative_freeze = destination.read_freeze()
     if authoritative_freeze != plan.freeze:
         raise release.ReleaseError("issue freeze readback differs from packaged release identity")
@@ -303,19 +331,65 @@ def execute(
             sleep=sleep,
         )
         log("github: draft created")
-    for name in plan.missing_assets:
-        github_retry(
-            lambda name=name: destination.upload_asset(tag, name, dist / name),
-            log=log,
-            completed=lambda name=name: asset_done(name),
-            sleep=sleep,
-        )
-        log(f"github: asset verified {name}")
-    if plan.missing_crate:
-        destination.publish_crate(crate)
-        log("crates.io: publish attempted")
+    # The two network destinations transfer concurrently. Workers buffer their logs;
+    # the job prints each destination's complete transcript in a fixed order.
+    github_lines: list[str] = []
+    crate_lines: list[str] = []
+
+    def transfer_assets() -> None:
+        for name in plan.missing_assets:
+            github_retry(
+                lambda name=name: destination.upload_asset(tag, name, dist / name),
+                log=github_lines.append,
+                completed=lambda name=name: asset_done(name),
+                sleep=sleep,
+            )
+            github_lines.append(f"github: asset verified {name}")
+
+    def transfer_crate() -> None:
+        if plan.missing_crate:
+            try:
+                destination.publish_crate(crate)
+            except AmbiguousCratePublishError:
+                # Cargo may lose its response after crates.io accepted the upload.
+                # A matching registry checksum is the only safe success signal.
+                for attempt in range(10):
+                    if (
+                        destination.crate_checksum(str(directive["version"]))
+                        == plan.freeze["crate_sha256"]
+                    ):
+                        crate_lines.append("crates.io: accepted despite ambiguous response")
+                        break
+                    if attempt == 9:
+                        raise
+                    sleep(min(2**attempt, 30))
+            crate_lines.append("crates.io: publish attempted")
+
+    log("release: GitHub assets and crates.io transfers started on one worker")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        github_transfer = pool.submit(transfer_assets)
+        crate_transfer = pool.submit(transfer_crate)
+        failures: list[Exception] = []
+        for label, future, lines in (
+            ("github", github_transfer, github_lines),
+            ("crates.io", crate_transfer, crate_lines),
+        ):
+            try:
+                future.result()
+            except Exception as error:
+                log(f"{label}: transfer failed: {error}")
+                failures.append(error)
+            for line in lines:
+                log(line)
+        if failures:
+            raise failures[0]
     # Re-read authoritative destinations after potentially ambiguous writes.
     complete = preflight(destination, directive, info, dist, crate, plan.freeze)
+    for attempt in range(9):
+        if not complete.missing_crate:
+            break
+        sleep(min(2**attempt, 30))
+        complete = preflight(destination, directive, info, dist, crate, plan.freeze)
     if (
         complete.missing_tag
         or complete.missing_release
