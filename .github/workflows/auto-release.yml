@@ -530,7 +530,17 @@ jobs:
           python3 ci/verify_release_test_bundle.py --archive "$archive" --bundle "$bundle" --asset "$ASSET"
           mkdir -p release-test-bundle
           tar -C release-test-bundle -xzf "$bundle"
-          python3 ci/run_test_bundle.py release-test-bundle
+          if [[ "$ASSET" == macos-* ]]; then
+            # task_for_pid is deliberately denied to an ordinary hosted-macOS user.
+            # Run the other 54 tests with normal privileges, then exercise the one
+            # out-of-process zone-enumeration test as root instead of skipping it.
+            python3 ci/run_test_bundle.py release-test-bundle \
+              --exclude test-osx-zone-introspect-remote
+            sudo -n "$(command -v python3)" ci/run_test_bundle.py release-test-bundle \
+              --only test-osx-zone-introspect-remote
+          else
+            python3 ci/run_test_bundle.py release-test-bundle
+          fi
 
   preflight-assets:
     name: Collate and validate exact release archives
