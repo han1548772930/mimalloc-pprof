@@ -1,8 +1,9 @@
 # mimalloc-pprof — agent guidance
 
 > [!IMPORTANT]
-> Ordinary PR/main CI is fractional. Add `ci-full` to a PR for every supported
-> platform; a release needs the full matrix on the exact merged commit SHA.
+> Internal PR/main CI is fractional. External-contributor PRs run the full test
+> matrix automatically (#463). A release needs the full matrix on the exact
+> merged commit SHA.
 > Start or resume the issue-driven release attempt through `ci/release.py`.
 > Read [docs/release-process.md](docs/release-process.md) before changing release
 > workflows or trying to tag, publish, or dispatch a release.
@@ -19,10 +20,11 @@ if the sub-issue conflicts with older prose in #2, the sub-issue + #2's Decision
 
 ## Hard rules
 
-Ordinary PR and `main` CI use the minimal lane. Add literal `ci-test` for the
+Internal PR and `main` CI use the minimal lane. Add literal `ci-test` for the
 complete C test DAG; add `ci-full` for the release platform matrix, including
-native Intel and Apple Silicon execution. Label changes recompute the mode on
-the same PR head. A release requires full validation from exact-SHA dispatches
+native Intel and Apple Silicon execution. External PR authors without write
+access receive the full test matrix without a label (#463). Label changes
+recompute the mode on the same PR revision. A release requires full validation from exact-SHA dispatches
 before tagging. Real publication requires the issue freeze, matching packaged
 crate, exact-SHA full CI, and shipped-asset smoke gates. The issue body must
 explicitly say `- State: **ready-to-publish**.`; a dry run never sets that state.
@@ -58,9 +60,10 @@ See
    to require; every `test-osx-*` must carry `LABELS macos` (`ci/check_macos_labels.py`).
    Issue #444 makes one narrow owner-approved exception: `run-macos-native-full` executes
    the same Linux-built ARM64 and x64 bundles on hosted `macos-15` and `macos-15-intel`
-   only for a literal `ci-full` PR label or an explicit `ci-mode=full` dispatch. Ordinary
-   PR/main events allocate no hosted Mac runner. The full dispatch requires an exact
-   `candidate_sha`, verified by `resolve-candidate`; PR runs build the PR head SHA.
+   for a literal `ci-full` PR label, an external-contributor PR, or an explicit
+   `ci-mode=full` dispatch. Internal minimal PR/main events allocate no hosted Mac
+   runner. The full dispatch requires an exact `candidate_sha`, verified by
+   `resolve-candidate`; PR runs build the test-merge SHA.
    `ci/lint_no_macos_runners.py` rejects any
    other macOS runner label, including an exception whose opt-in gate is removed.
    The guest boots macOS **Recovery** straight off the image every run via the
