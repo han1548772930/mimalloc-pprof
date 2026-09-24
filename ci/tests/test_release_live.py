@@ -13,6 +13,7 @@ import threading
 import unittest
 import urllib.request
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 from ci import release_live
@@ -88,11 +89,11 @@ class LiveUploadTests(unittest.TestCase):
         class Registry(http.server.BaseHTTPRequestHandler):
             payload: bytes | None = None
 
-            def log_message(self, *_: object) -> None:
-                return None
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
 
             def do_GET(self) -> None:
-                port = self.server.server_address[1]
+                _, port = cast(tuple[str, int], self.server.server_address)
                 if self.path == "/index/config.json":
                     self._send_json(
                         {
