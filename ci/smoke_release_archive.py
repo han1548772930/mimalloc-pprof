@@ -52,10 +52,23 @@ def verify_and_smoke(dist: Path, asset: str, candidate_sha: str) -> None:
         directory = Path(temp)
         library_path = directory / Path(binary_name).name
         library_path.write_bytes(binary)
-        if asset == "windows-x64-gnu":
-            runtime = "bin/libgcc_s_seh-1.dll"
-            (directory / Path(runtime).name).write_bytes(members[runtime])
         if sys.platform == "win32":
+            # LoadLibrary must see the complete shipped DLL closure beside mimalloc.dll.
+            # This includes mimalloc-redirect.dll on both ABIs and libgcc on GNU.
+            dlls: dict[str, tuple[str, bytes]] = {}
+            for name, data in members.items():
+                path = Path(name)
+                if path.parent.as_posix() != "bin" or path.suffix.lower() != ".dll":
+                    continue
+                key = path.name.casefold()
+                if key in dlls:
+                    raise ReleaseError(
+                        f"case-colliding Windows DLL members: {dlls[key][0]}, {name}"
+                    )
+                dlls[key] = (name, data)
+            for key, (name, data) in dlls.items():
+                if key != library_path.name.casefold():
+                    (directory / Path(name).name).write_bytes(data)
             with os.add_dll_directory(str(directory)):
                 library = ctypes.CDLL(str(library_path))
                 allocation_smoke(library)
