@@ -139,6 +139,8 @@ def allowed_full_runner(file: Path, document: object, path: str, label: str) -> 
     if file.name == "auto-release.yml" and path == "jobs.smoke-shipped-assets.strategy.matrix":
         jobs = cast("dict[str, object]", cast("dict[str, object]", document).get("jobs", {}))
         job = cast("dict[str, object]", jobs.get("smoke-shipped-assets", {}))
+        preflight = cast("dict[str, object]", jobs.get("preflight-assets", {}))
+        release = cast("dict[str, object]", jobs.get("release", {}))
         matrix = cast(
             "dict[str, object]",
             cast("dict[str, object]", job.get("strategy", {})).get("matrix", {}),
@@ -146,8 +148,11 @@ def allowed_full_runner(file: Path, document: object, path: str, label: str) -> 
         return (
             label in {"macos-15", "macos-15-intel"}
             and job.get("runs-on") == "${{ matrix.runner }}"
-            and job.get("if") == "inputs.dry_run == true"
-            and job.get("needs") == ["release"]
+            and "if" not in job
+            and job.get("needs") == ["preflight-assets"]
+            and preflight.get("needs")
+            == ["build-and-package", "build-binaries", "test-shipped-assets"]
+            and release.get("needs") == ["preflight-assets", "smoke-shipped-assets"]
             and matrix.get("include")
             == [
                 {"asset": "macos-arm64", "runner": "macos-15"},
