@@ -17,10 +17,11 @@ import struct
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "zackees/mimalloc-pprof"
@@ -125,11 +126,41 @@ def parse_directive(body: str) -> dict[str, Any] | None:
     return parsed
 
 
-def issue_comments(issue: int) -> list[str]:
-    raw = command(
-        "gh", "api", "--paginate", "--slurp", f"repos/{REPO}/issues/{issue}/comments?per_page=100"
-    )
-    pages = cast(list[list[dict[str, Any]]], json.loads(raw))
+def issue_comments(issue: int, sleep: Callable[[float], None] = time.sleep) -> list[str]:
+    pages: list[list[dict[str, Any]]] | None = None
+    for attempt in range(10):
+        raw = command(
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{REPO}/issues/{issue}/comments?per_page=100",
+        )
+        try:
+            parsed: object = json.loads(raw)
+            if (
+                not isinstance(parsed, list)
+                or not all(isinstance(page, list) for page in parsed)
+                or not all(
+                    isinstance(row, dict)
+                    and isinstance(row.get("body"), str)
+                    and isinstance(row.get("author_association"), str)
+                    and isinstance(row.get("user"), dict)
+                    and isinstance(row["user"].get("login"), str)
+                    for page in parsed
+                    for row in page
+                )
+            ):
+                raise json.JSONDecodeError("issue comment response is not page JSON", raw, 0)
+            pages = cast(list[list[dict[str, Any]]], parsed)
+            break
+        except json.JSONDecodeError as error:
+            if attempt == 9:
+                raise ReleaseError(
+                    "GitHub issue comments returned malformed JSON after 10 attempts"
+                ) from error
+            sleep(min(2**attempt, 30))
+    assert pages is not None
     trusted = {"OWNER", "MEMBER", "COLLABORATOR"}
     return [
         str(row["body"])
