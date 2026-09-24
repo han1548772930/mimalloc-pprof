@@ -142,6 +142,22 @@ class ReleaseFrontdoorTests(unittest.TestCase):
     def test_archive_member_paths_and_symlink_targets_are_confined(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            rooted_tar = root / "rooted.tar.gz"
+            with tarfile.open(rooted_tar, "w:gz") as archive:
+                root_entry = tarfile.TarInfo(".")
+                root_entry.type = tarfile.DIRTYPE
+                archive.addfile(root_entry)
+                data = b"safe"
+                file_entry = tarfile.TarInfo("./safe.txt")
+                file_entry.size = len(data)
+                archive.addfile(file_entry, BytesIO(data))
+            self.assertEqual(release.archive_members(rooted_tar), {"safe.txt": b"safe"})
+            with tarfile.open(rooted_tar, "w:gz") as archive:
+                root_file = tarfile.TarInfo(".")
+                root_file.size = 1
+                archive.addfile(root_file, BytesIO(b"x"))
+            with self.assertRaisesRegex(release.ReleaseError, "unsafe archive member"):
+                release.archive_members(rooted_tar)
             zip_path = root / "bad.zip"
             for member in ("C:/escape", "dir\\escape", "../escape"):
                 with zipfile.ZipFile(zip_path, "w") as archive:

@@ -70,18 +70,22 @@ class ReleaseTestBundleTests(unittest.TestCase):
             ("./device", tarfile.CHRTYPE),
             ("./block", tarfile.BLKTYPE),
         ]
-        with TemporaryDirectory() as temp:
-            root = tarfile.TarInfo(".")
-            root.type = tarfile.DIRTYPE
-            self.check_case(
-                Path(temp),
-                asset,
-                shared_name,
-                static_name,
-                bundle_shared,
-                bundle_static,
-                extra_rows=[root],
-            )
+        for root_name in (".", "./"):
+            with self.subTest(root_name=root_name), TemporaryDirectory() as temp:
+                root = tarfile.TarInfo(root_name)
+                root.type = tarfile.DIRTYPE
+                safe_link = tarfile.TarInfo("./libmimalloc.3.dylib")
+                safe_link.type = tarfile.SYMTYPE
+                safe_link.linkname = bundle_shared
+                self.check_case(
+                    Path(temp),
+                    asset,
+                    shared_name,
+                    static_name,
+                    bundle_shared,
+                    bundle_static,
+                    extra_rows=[root, safe_link],
+                )
         with TemporaryDirectory() as temp:
             self.check_case(
                 Path(temp),
@@ -105,6 +109,29 @@ class ReleaseTestBundleTests(unittest.TestCase):
                     bundle_shared,
                     bundle_static,
                     extra_rows=[row],
+                    expected_error="unsafe test bundle member",
+                )
+        unsafe_links = [
+            [("./escape", "../outside")],
+            [("./dangling", "missing")],
+            [("./cycle-a", "cycle-b"), ("./cycle-b", "cycle-a")],
+        ]
+        for definitions in unsafe_links:
+            with self.subTest(definitions=definitions), TemporaryDirectory() as temp:
+                links: list[tarfile.TarInfo] = []
+                for name, target in definitions:
+                    row = tarfile.TarInfo(name)
+                    row.type = tarfile.SYMTYPE
+                    row.linkname = target
+                    links.append(row)
+                self.check_case(
+                    Path(temp),
+                    asset,
+                    shared_name,
+                    static_name,
+                    bundle_shared,
+                    bundle_static,
+                    extra_rows=links,
                     expected_error="unsafe test bundle member",
                 )
 
