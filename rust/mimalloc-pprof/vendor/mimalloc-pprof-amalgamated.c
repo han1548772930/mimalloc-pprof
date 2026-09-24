@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 0646d937 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 650c0362 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -11503,6 +11503,9 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
   const size_t tseq = theap->tld->thread_seq;
   mi_arena_t* const req_arena = heap->exclusive_arena;
 
+  // `slice_count` is the size a fresh page of this bin would be given; it is
+  // deliberately NOT the search key. Abandoned pages are found by bin, and the
+  // claimed page's own slice range is what gets validated below.
   MI_UNUSED(slice_count);
   const size_t bin = _mi_bin(block_size);
   if (bin >= MI_ARENA_BIN_COUNT) {
@@ -11538,6 +11541,17 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
         mi_theap_stat_counter_increase(theap, pages_reclaim_on_alloc, 1);
 
         _mi_page_free_collect(page, false);  // update `used` count
+        // The page was found by BIN, and a bin's pages are no longer all one
+        // size: `mi_dynamic_large_page_size` picks the span from the live worker
+        // count, so one size class can hold both a 4 MiB page (created while the
+        // heap was still below the threshold) and a compacted 1 MiB one. The
+        // caller's `slice_count` is only what a FRESH page of this bin would have
+        // been given, so validating the claimed page over that range would run
+        // past the end of the smaller page -- into slices that belong to no page
+        // at all, and so are free and not dirty. Validate the range the page
+        // actually occupies.
+        mi_arena_pages_t* page_arena_pages = NULL;
+        (void)mi_page_arena_pages(page, &slice_index, &slice_count, &page_arena_pages);
         mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
         mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
         mi_assert_internal(mi_bitmap_is_setN(arena->slices_dirty, slice_index, slice_count));
@@ -11859,9 +11873,16 @@ static mi_page_t* mi_arenas_page_singleton_alloc(mi_theap_t* theap, size_t block
   return page;
 }
 
-// This runs only before allocating a fresh regular large page. It uses queue
-// history to separate sparse low-churn queues from hot queues that benefit from
-// the default 4 MiB geometry. Existing pages are never resized.
+// Span size for a freshly created regular large page, i.e. for blocks above
+// `MI_MEDIUM_MAX_OBJ_SIZE` and up to `MI_LARGE_MAX_OBJ_SIZE` (~84 KiB..512 KiB).
+// Called only on the page-creation slow path; existing pages keep the span they
+// were created with and are never resized.
+//
+// Note this is a property of the HEAP at the moment of creation, not of the
+// size class alone: the same bin can hold a 4 MiB page and a compacted 1 MiB
+// one. Anything that finds a page by bin must therefore read the span from the
+// page itself (`mi_page_arena_pages`) rather than assume the bin implies it --
+// see `mi_arenas_page_try_find_abandoned`.
 static size_t mi_dynamic_large_page_size(mi_theap_t* theap, size_t block_size) {
   // Compacting spans trades fewer resident holes for more page/span churn. Keep
   // the original geometry for low-concurrency heaps; aggregate pressure from a
@@ -11873,9 +11894,7 @@ static size_t mi_dynamic_large_page_size(mi_theap_t* theap, size_t block_size) {
   // Exact power-of-two classes are the hot reuse path in the scaling suite;
   // keep their original span size even when other classes compact.
   if (_mi_is_power_of_two(block_size)) return MI_LARGE_PAGE_SIZE;
-  // Irregular classes use 1 MiB spans under sustained worker pressure. Exact
-  // power-of-two classes above remain on the 4 MiB reuse path.
-  MI_UNUSED(block_size);
+  // Irregular classes use 1 MiB spans under sustained worker pressure.
   return MI_ARENA_SLICE_SIZE * 16;
 }
 
