@@ -25,6 +25,7 @@ class FakeDestination:
         self.freeze_visible = True
         self.release_target_is_tag = False
         self.crate_error_after_write = False
+        self.crate_publish_error: Exception | None = None
         self.freeze_failures = 0
         self.crate_validation_error: Exception | None = None
 
@@ -83,11 +84,13 @@ class FakeDestination:
         self.maybe_ambiguous(f"asset:{name}")
 
     def publish_crate(self, path: Path) -> None:
+        if self.crate_publish_error is not None:
+            raise self.crate_publish_error
         self.crate = rd.file_sha256(path)
         self.events.append("crate")
         if self.crate_error_after_write:
             self.crate_error_after_write = False
-            raise RuntimeError("response lost after registry accepted crate")
+            raise rd.AmbiguousCratePublishError("response lost after registry accepted crate")
 
     def finalize(self, tag: str) -> None:
         self.draft = False
@@ -113,6 +116,7 @@ class DestinationTests(unittest.TestCase):
             **self.value,
         }
         self.backend = FakeDestination()
+        self.sleeps: list[float] = []
 
     def run_worker(self, frozen: dict[str, object] | None = None) -> None:
         with patch.object(release, "verify_info"):
@@ -124,7 +128,7 @@ class DestinationTests(unittest.TestCase):
                 self.crate,
                 frozen,
                 log=lambda _: None,
-                sleep=lambda _: None,
+                sleep=self.sleeps.append,
             )
 
     def test_freeze_precedes_writes_and_partial_resume(self) -> None:
@@ -166,6 +170,15 @@ class DestinationTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "crates.io checksum"):
             self.run_worker()
         self.assertEqual(self.backend.events, [])
+
+    def test_permanent_crate_rejection_does_not_poll_or_back_off(self) -> None:
+        self.backend.crate_publish_error = release.ReleaseError(
+            "crates.io upload returned HTTP 403"
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "HTTP 403"):
+            self.run_worker()
+        self.assertEqual(self.sleeps, [])
+        self.assertIsNone(self.backend.crate)
 
     def test_crate_success_then_github_resume(self) -> None:
         self.backend.crate = rd.file_sha256(self.crate)

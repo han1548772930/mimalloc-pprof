@@ -142,10 +142,14 @@ class LiveDestination(destinations.ReadOnlyDestination):
                 if outcome.get("errors"):
                     raise release.ReleaseError("crates.io rejected publish metadata or archive")
         except urllib.error.HTTPError as error:
-            raise release.ReleaseError(f"crates.io upload returned HTTP {error.code}") from error
-        except urllib.error.URLError as error:
-            raise release.ReleaseError(
-                f"crates.io upload transport failed: {error.reason}"
+            message = f"crates.io upload returned HTTP {error.code}"
+            if error.code == 429 or error.code >= 500:
+                raise destinations.AmbiguousCratePublishError(message) from error
+            raise release.ReleaseError(message) from error
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            reason = error.reason if isinstance(error, urllib.error.URLError) else error
+            raise destinations.AmbiguousCratePublishError(
+                f"crates.io upload transport failed: {reason}"
             ) from error
 
     def finalize(self, tag: str) -> None:

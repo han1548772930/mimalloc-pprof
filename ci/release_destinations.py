@@ -22,6 +22,10 @@ class TransientGitHubError(Exception):
     """A retryable transport or GitHub server failure (not a conflict)."""
 
 
+class AmbiguousCratePublishError(release.ReleaseError):
+    """The registry may have accepted the crate before the response was lost."""
+
+
 MAX_CRATE_BYTES = 10_000_000  # crates.io's compressed .crate upload limit
 
 
@@ -346,7 +350,7 @@ def execute(
         if plan.missing_crate:
             try:
                 destination.publish_crate(crate)
-            except Exception:
+            except AmbiguousCratePublishError:
                 # Cargo may lose its response after crates.io accepted the upload.
                 # A matching registry checksum is the only safe success signal.
                 for attempt in range(10):

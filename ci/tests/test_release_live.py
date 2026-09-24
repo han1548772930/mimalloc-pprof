@@ -11,12 +11,14 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
+from email.message import Message
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
-from ci import release_live
+from ci import release, release_destinations, release_live
 
 
 class FakeResponse:
@@ -33,6 +35,38 @@ class FakeResponse:
 
 
 class LiveUploadTests(unittest.TestCase):
+    def test_permanent_registry_http_error_is_not_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            crate = Path(temporary) / "mimalloc-pprof-1.0.1.crate"
+            archive = b"exact frozen archive bytes"
+            crate.write_bytes(archive)
+            destination = release_live.LiveDestination(444, crate)
+            frozen = {"crate_sha256": hashlib.sha256(archive).hexdigest()}
+            metadata: dict[str, object] = {
+                "name": "mimalloc-pprof",
+                "vers": "1.0.1",
+                "deps": [],
+            }
+            error = urllib.error.HTTPError(
+                "https://crates.io/api/v1/crates/new",
+                403,
+                "forbidden",
+                Message(),
+                None,
+            )
+            with (
+                patch.object(destination, "read_freeze", return_value=frozen),
+                patch.object(release_live, "crate_publish_metadata", return_value=metadata),
+                patch.object(release_live.urllib.request, "urlopen", side_effect=error),
+                patch.dict(os.environ, {"CARGO_REGISTRY_TOKEN": "test-only-token"}),
+                self.assertRaises(release.ReleaseError) as raised,
+            ):
+                destination.validate_crate(crate)
+                destination.publish_crate(crate)
+            self.assertNotIsInstance(
+                raised.exception, release_destinations.AmbiguousCratePublishError
+            )
+
     def test_put_sends_the_frozen_archive_as_the_exact_registry_body_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             crate = Path(temporary) / "mimalloc-pprof-1.0.1.crate"
