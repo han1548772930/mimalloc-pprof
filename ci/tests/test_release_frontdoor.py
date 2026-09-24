@@ -24,18 +24,33 @@ class ReleaseFrontdoorTests(unittest.TestCase):
     def test_issue_comment_read_retries_empty_success_response(self) -> None:
         sleeps: list[float] = []
         response = json.dumps(
-            [[{"body": "trusted", "author_association": "OWNER", "user": {"login": "owner"}}]]
+            [{"body": "trusted", "author_association": "OWNER", "login": "owner"}]
         )
         with patch.object(release, "command", side_effect=["", response]):
             self.assertEqual(release.issue_comments(444, sleep=sleeps.append), ["trusted"])
         self.assertEqual(sleeps, [1])
 
-    def test_issue_comment_read_accepts_single_flat_page_from_gh(self) -> None:
-        response = json.dumps(
-            [{"body": "trusted", "author_association": "OWNER", "user": {"login": "owner"}}]
+    def test_issue_comment_read_accepts_paginated_json_lines_from_gh(self) -> None:
+        response = "\n".join(
+            json.dumps(page)
+            for page in (
+                [{"body": "owner\nbody", "author_association": "OWNER", "login": "owner"}],
+                [
+                    {
+                        "body": "automation",
+                        "author_association": "NONE",
+                        "login": "github-actions[bot]",
+                    },
+                    {"body": "untrusted", "author_association": "NONE", "login": "outsider"},
+                ],
+            )
         )
         with patch.object(release, "command", return_value=response):
-            self.assertEqual(release.issue_comments(444), ["trusted"])
+            self.assertEqual(release.issue_comments(444), ["owner\nbody", "automation"])
+
+    def test_issue_comment_read_accepts_valid_empty_page(self) -> None:
+        with patch.object(release, "command", return_value="[]"):
+            self.assertEqual(release.issue_comments(444), [])
 
     def test_issue_comment_read_bounds_malformed_response_retries(self) -> None:
         sleeps: list[float] = []
@@ -45,14 +60,20 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         ):
             release.issue_comments(444, sleep=sleeps.append)
         self.assertEqual(sleeps, [1, 2, 4, 8, 16, 30, 30, 30, 30])
-        self.assertEqual(release._json_shape(""), "empty")
-        self.assertEqual(release._json_shape("<html>"), "non-json/6-bytes")
-        self.assertEqual(release._json_shape('{"message":"rate limited"}'), "dict")
+        self.assertEqual(release.json_lines_shape(""), "empty")
+        self.assertEqual(release.json_lines_shape("<html>"), "ndjson/0-of-1-lines/6-bytes")
+        self.assertEqual(
+            release.json_lines_shape('{"body":"ok"}\nnot-json'),
+            "ndjson/1-of-2-lines/22-bytes",
+        )
 
-    def test_issue_comment_read_retries_malformed_nested_rows(self) -> None:
+    def test_issue_comment_read_retries_malformed_rows(self) -> None:
         sleeps: list[float] = []
-        with patch.object(release, "command", side_effect=["[[null]]", "[[]]"]):
-            self.assertEqual(release.issue_comments(444, sleep=sleeps.append), [])
+        response = json.dumps(
+            [{"body": "trusted", "author_association": "OWNER", "login": "owner"}]
+        )
+        with patch.object(release, "command", side_effect=["null", response]):
+            self.assertEqual(release.issue_comments(444, sleep=sleeps.append), ["trusted"])
         self.assertEqual(sleeps, [1])
 
     def test_issue_comment_read_does_not_retry_command_failure(self) -> None:
@@ -451,13 +472,13 @@ class ReleaseFrontdoorTests(unittest.TestCase):
     def test_issue_directive_ignores_untrusted_comments(self) -> None:
         value = release.directive(444, "1.0.1", SHA)
         body = release.comment_body(value, "ready")
-        comments = [
+        comments = json.dumps(
             [
-                {"body": body, "author_association": "NONE", "user": {"login": "outsider"}},
-                {"body": body, "author_association": "OWNER", "user": {"login": "zackees"}},
+                {"body": body, "author_association": "NONE", "login": "outsider"},
+                {"body": body, "author_association": "OWNER", "login": "zackees"},
             ]
-        ]
-        with patch.object(release, "command", return_value=json.dumps(comments)):
+        )
+        with patch.object(release, "command", return_value=comments):
             self.assertEqual(release.issue_directives(444), [value])
 
     def test_workflow_has_issue_gate_before_every_build(self) -> None:

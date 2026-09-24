@@ -127,70 +127,65 @@ def parse_directive(body: str) -> dict[str, Any] | None:
 
 
 def issue_comments(issue: int, sleep: Callable[[float], None] = time.sleep) -> list[str]:
-    pages: list[list[dict[str, Any]]] | None = None
+    rows: list[dict[str, str]] | None = None
     for attempt in range(10):
         raw = command(
             "gh",
             "api",
             "--paginate",
-            "--slurp",
             f"repos/{REPO}/issues/{issue}/comments?per_page=100",
+            "--jq",
+            "[.[] | {body: .body, author_association: .author_association, login: .user.login}]",
         )
         try:
-            parsed: object = json.loads(raw)
-            # gh has emitted both shapes for `api --paginate --slurp` across
-            # runner versions: a list of page arrays and, for a one-page
-            # response, the page array itself.  Normalize the latter before
-            # validating rows so a CLI presentation detail cannot block a
-            # release after every artifact has already passed.
-            if isinstance(parsed, list) and all(isinstance(row, dict) for row in parsed):
-                parsed = [parsed]
-            if (
-                not isinstance(parsed, list)
-                or not all(isinstance(page, list) for page in parsed)
-                or not all(
-                    isinstance(row, dict)
-                    and isinstance(row.get("body"), str)
-                    and isinstance(row.get("author_association"), str)
-                    and isinstance(row.get("user"), dict)
-                    and isinstance(row["user"].get("login"), str)
-                    for page in parsed
-                    for row in page
-                )
-            ):
-                raise json.JSONDecodeError("issue comment response is not page JSON", raw, 0)
-            pages = cast(list[list[dict[str, Any]]], parsed)
+            if not raw:
+                raise json.JSONDecodeError("empty issue comment response", raw, 0)
+            parsed_rows: list[dict[str, str]] = []
+            for line in raw.splitlines():
+                page: object = json.loads(line)
+                if not isinstance(page, list):
+                    raise json.JSONDecodeError("invalid issue comment page", line, 0)
+                for parsed in cast(list[object], page):
+                    if not isinstance(parsed, dict):
+                        raise json.JSONDecodeError("invalid issue comment row", line, 0)
+                    untyped_row = cast(dict[str, object], parsed)
+                    if not all(
+                        isinstance(untyped_row.get(field), str)
+                        for field in ("body", "author_association", "login")
+                    ):
+                        raise json.JSONDecodeError("invalid issue comment row", line, 0)
+                    parsed_rows.append(cast(dict[str, str], untyped_row))
+            rows = parsed_rows
             break
         except json.JSONDecodeError as error:
             if attempt == 9:
                 raise ReleaseError(
-                    "GitHub issue comments returned malformed JSON after 10 attempts "
-                    f"(response shape: {_json_shape(raw)})"
+                    "GitHub issue comments returned malformed JSON lines after 10 attempts "
+                    f"(response shape: {json_lines_shape(raw)})"
                 ) from error
             sleep(min(2**attempt, 30))
-    assert pages is not None
+    assert rows is not None
     trusted = {"OWNER", "MEMBER", "COLLABORATOR"}
     return [
-        str(row["body"])
-        for page in pages
-        for row in page
-        if row.get("author_association") in trusted
-        or row.get("user", {}).get("login") == "github-actions[bot]"
+        row["body"]
+        for row in rows
+        if row["author_association"] in trusted or row["login"] == "github-actions[bot]"
     ]
 
 
-def _json_shape(raw: str) -> str:
+def json_lines_shape(raw: str) -> str:
     """Describe an API response without exposing issue-comment contents."""
     if not raw:
         return "empty"
-    try:
-        value: object = json.loads(raw)
-    except json.JSONDecodeError:
-        return f"non-json/{len(raw)}-bytes"
-    if not isinstance(value, list):
-        return type(value).__name__
-    kinds = sorted({type(item).__name__ for item in value})
-    return f"list[{','.join(kinds)}]/{len(value)}"
+    lines = raw.splitlines()
+    valid = 0
+    for line in lines:
+        try:
+            json.loads(line)
+            valid += 1
+        except json.JSONDecodeError:
+            pass
+    return f"ndjson/{valid}-of-{len(lines)}-lines/{len(raw)}-bytes"
 
 
 def issue_directives(issue: int) -> list[dict[str, Any]]:
