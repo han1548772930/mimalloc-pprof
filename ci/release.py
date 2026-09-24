@@ -456,9 +456,9 @@ def archive_members(path: Path) -> dict[str, bytes]:
     except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError) as error:
         raise ReleaseError(f"malformed archive {path.name}: {error}") from error
     for raw, is_directory, data in entries:
-        name = raw.removeprefix("./").rstrip("/")
-        if not name and raw in (".", "./") and is_directory:
+        if raw in (".", "./") and is_directory:
             continue
+        name = raw.removeprefix("./").rstrip("/")
         if (
             name.startswith("/")
             or "\\" in name

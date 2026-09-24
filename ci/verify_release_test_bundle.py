@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import posixpath
 import re
 import tarfile
 from pathlib import Path
@@ -45,10 +46,11 @@ def verify(archive: Path, bundle: Path, asset: str) -> None:
 
     with tarfile.open(bundle, "r:gz") as tar:
         rows: dict[str, tarfile.TarInfo] = {}
+        links: dict[str, str] = {}
         root_seen = False
         for row in tar.getmembers():
             raw = row.name
-            if raw == "." and row.isdir():
+            if raw in (".", "./") and row.isdir():
                 if root_seen:
                     raise ReleaseError(f"duplicate test bundle member {raw}")
                 root_seen = True
@@ -60,13 +62,37 @@ def verify(archive: Path, bundle: Path, asset: str) -> None:
                 or "\\" in name
                 or re.match(r"^[A-Za-z]:", name)
                 or any(part in ("", ".", "..") for part in name.rstrip("/").split("/"))
-                or not (row.isfile() or row.isdir())
+                or not (row.isfile() or row.isdir() or row.issym())
             ):
                 raise ReleaseError(f"unsafe test bundle member {raw}")
             if row.isfile():
-                if name in rows:
+                if name in rows or name in links:
                     raise ReleaseError(f"duplicate test bundle member {raw}")
                 rows[name] = row
+            elif row.issym():
+                if (
+                    name in links
+                    or name in rows
+                    or row.linkname.startswith("/")
+                    or "\\" in row.linkname
+                    or re.match(r"^[A-Za-z]:", row.linkname)
+                ):
+                    raise ReleaseError(f"unsafe test bundle member {raw}")
+                links[name] = row.linkname
+        for name in links:
+            seen: set[str] = set()
+            current = name
+            while current in links:
+                if current in seen:
+                    raise ReleaseError(f"unsafe test bundle member {name}")
+                seen.add(current)
+                current = posixpath.normpath(
+                    posixpath.join(posixpath.dirname(current), links[current])
+                )
+                if current == ".." or current.startswith("../"):
+                    raise ReleaseError(f"unsafe test bundle member {name}")
+            if current not in rows:
+                raise ReleaseError(f"unsafe test bundle member {name}")
         manifest = rows.get("tests.json")
         if manifest is None:
             raise ReleaseError("test bundle has no tests.json")
