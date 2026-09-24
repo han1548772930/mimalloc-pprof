@@ -19,10 +19,9 @@ name: auto-release
 #      Shipping a natively-built binary while testing a cross-built one would mean the
 #      thing under test and the thing shipped are different binaries.
 #
-# So: the same `soldr prepare` toolchains, the same `cmake/toolchains/soldr-<triple>.cmake`
-# toolchain files and the same commit that produce the test bundles executed by
-# `macos-bundles.yml` and `windows-bundles.yml` also produce these assets. The bundles are
-# the evidence for the assets.
+# The release build uses the same cross toolchains as the full CI bundles, but a distinct
+# product configuration. Its own test bundle is built in the same tree as the installed
+# libraries; native release jobs compare the bytes and execute that bundle.
 #
 # What that costs, stated rather than hidden:
 #   - macOS assets are built by soldr's clang 21 against soldr's Apple SDK, NOT by Xcode's
@@ -55,14 +54,18 @@ name: auto-release
 on:
   workflow_dispatch:
     inputs:
+      issue_number:
+        description: "Release attempt issue carrying the immutable directive"
+        required: true
+        type: number
       dry_run:
         description: "Dry run: build, package, and cargo publish --dry-run only; create no tag or release"
         required: false
         type: boolean
         default: true
       candidate_sha:
-        description: "Exact candidate commit SHA (required for a real release)"
-        required: false
+        description: "Exact merged candidate commit SHA"
+        required: true
         type: string
       full_run_id:
         description: "Successful macos-bundles full run ID at candidate_sha (required for a real release)"
@@ -96,6 +99,24 @@ env:
   IS_DRY_RUN: ${{ inputs.dry_run }}
 
 jobs:
+  validate-attempt:
+    name: Validate issue directive and exact candidate SHA
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+      - name: Refuse unrecorded or conflicting release attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: python3 ci/release.py worker-check --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA"
+
   build-and-package:
     name: Build, validate, package (ubuntu-latest)
     # One row, not a matrix. #277's review addendum, item 5: everything this job does --
@@ -105,15 +126,15 @@ jobs:
     # that verified nothing the ubuntu row does not. The binaries are built by
     # `build-binaries` below, on Linux, for every shipped platform.
     runs-on: ubuntu-latest
+    needs: [validate-attempt]
     defaults:
       run:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.candidate_sha || github.sha }}
+          ref: ${{ inputs.candidate_sha }}
       - name: Verify package checkout is the release candidate
-        if: env.IS_DRY_RUN != 'true'
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: |
@@ -123,7 +144,7 @@ jobs:
       # during cache restore (issue #55), which skipped the publish job and turned a
       # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
       # retry action, so attempt it twice explicitly.
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75 # merged #518 audit recovery
         id: setup_soldr
         continue-on-error: true
         with:
@@ -135,7 +156,7 @@ jobs:
 
       - name: Retry toolchain setup (first attempt failed)
         if: steps.setup_soldr.outcome == 'failure'
-        uses: zackees/setup-soldr@v0
+        uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml
@@ -178,14 +199,13 @@ jobs:
   # header for why none of them runs on the platform it targets, and docs/ci-gates.md
   # ("Release assets are cross-built") for the same decision written out at length.
   #
-  # These use the SAME toolchain files and the SAME `soldr prepare` targets as
-  # macos-bundles.yml and windows-bundles.yml, so the binary a release ships is produced
-  # by the toolchain whose output those workflows actually execute. Locally reproducible
-  # with `uv run ci/verify_local.py --bundle <lane>-release` (#277 phase F), which builds
-  # the test bundle from the same configure line plus MI_BUILD_TESTS.
+  # These use the same toolchain files and `soldr prepare` targets as full CI. The
+  # product flags differ (notably MI_DHAT=OFF), so release-local native tests below
+  # execute a bundle built alongside the installed library bytes.
   build-binaries:
     name: Cross-build release binaries (${{ matrix.asset }})
     runs-on: ubuntu-latest
+    needs: [validate-attempt]
     strategy:
       fail-fast: false
       matrix:
@@ -205,15 +225,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.candidate_sha || github.sha }}
+          ref: ${{ inputs.candidate_sha }}
       - name: Verify binary checkout is the release candidate
-        if: env.IS_DRY_RUN != 'true'
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
         run: |
           [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" || { echo '::error::binary checkout differs from candidate_sha'; exit 1; }
       - uses: astral-sh/setup-uv@v3
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           # This job drives CMake directly; there is no `soldr cargo` for zccache to wrap.
@@ -243,8 +262,8 @@ jobs:
           fi
           soldr prepare "${args[@]}"
       - name: Configure, build and install
-        # MI_BUILD_TESTS=OFF is the only difference from the bundle lanes' Release
-        # configure line: a release asset ships the library, not 35 test executables.
+        # Build test executables in the very same tree as the installed product libraries.
+        # The product keeps DHAT disabled; full CI's DHAT-enabled bundles are separate.
         # The install rules carry this fork's own headers (include/mimalloc/profile.h and
         # memory-events.h) as well as upstream's, plus the pkg-config and CMake package
         # files and, on Windows, mimalloc-redirect.dll -- verified on all four lanes.
@@ -255,7 +274,7 @@ jobs:
           # heap snapshot / live-heap dump) rather than inheriting them from a default.
           # DHAT and the owner gate stay out, exactly as before.
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DMI_BUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MEMEVT=ON -DMI_DIAGNOSTICS=ON -DMI_DHAT=OFF -DMI_BUILD_TESTS=ON \
             --toolchain cmake/toolchains/soldr-${{ matrix.triple }}.cmake \
             --log-level=VERBOSE 2>&1 | tee configure.log
           # Assert on the RESOLVED library list, not on the option that was passed in --
@@ -273,6 +292,27 @@ jobs:
           fi
           cmake --build build --parallel
           cmake --install build --prefix "$PWD/stage"
+      - name: Bundle release-tree tests
+        run: |
+          set -euo pipefail
+          case '${{ matrix.triple }}' in
+            x86_64-pc-windows-gnu)
+              uv run ci/bundle_tests.py build release-test-bundle \
+                --objdump "$MINGW_W64_CROSS_BIN/x86_64-w64-mingw32-objdump" \
+                --dll-search-dir "$MINGW_W64_CROSS_ROOT/x86_64-w64-mingw32/lib"
+              ;;
+            x86_64-pc-windows-msvc)
+              uv run ci/bundle_tests.py build release-test-bundle \
+                --objdump llvm-objdump --check-dll-closure --allow-msvc-runtime
+              ;;
+            *) uv run ci/bundle_tests.py build release-test-bundle ;;
+          esac
+          tar -C release-test-bundle -czf release-test-bundle.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-test-bundle-${{ matrix.asset }}
+          path: release-test-bundle.tar.gz
+          if-no-files-found: error
       - name: Ship the toolchain runtime DLLs, and prove the import closure resolves
         # windows-gnu only in effect: soldr's mingw-w64 links mimalloc.dll against
         # libgcc_s_seh-1.dll (for __popcountdi2), which a plain Windows machine does not
@@ -363,13 +403,14 @@ jobs:
             echo "commit:   $(git rev-parse HEAD)"
             echo "target:   ${TRIPLE}"
             echo "built on: ubuntu-latest (Linux), cross-compiled through soldr $(soldr --version 2>/dev/null || echo '?')"
-            echo "config:   -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_BUILD_TESTS=OFF"
+            echo "config:   -DCMAKE_BUILD_TYPE=Release -DMI_PPROF=ON -DMI_MEMEVT=ON"
+            echo "          -DMI_DIAGNOSTICS=ON -DMI_DHAT=OFF -DMI_BUILD_TESTS=ON"
             echo
             echo "This binary was NOT built on the platform it targets. Every mimalloc-pprof"
             echo "release asset is cross-compiled on Linux, deliberately: mimalloc-pprof ships"
             echo "inside cross-compiled code, so the cross-built artifact is the product, and"
-            echo "it is the artifact this project's CI actually executes its test suite from"
-            echo "(.github/workflows/macos-bundles.yml, windows-bundles.yml)."
+            echo "The release test bundle is built in this same tree. Native release jobs"
+            echo "compare its libraries with this archive and execute its C tests."
             echo
             case "${TRIPLE}" in
               *-apple-darwin)
@@ -420,22 +461,127 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  test-shipped-assets:
+    name: Test packaged library (${{ matrix.asset }})
+    needs: [build-binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: macos-arm64
+            runner: macos-15
+            extension: tar.gz
+          - asset: macos-x86_64
+            runner: macos-15-intel
+            extension: tar.gz
+          - asset: windows-x64-gnu
+            runner: windows-latest
+            extension: zip
+          - asset: windows-x64-msvc
+            runner: windows-latest
+            extension: zip
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries-${{ matrix.asset }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-test-bundle-${{ matrix.asset }}
+          path: test-input
+      - name: Verify packaged bytes and execute the release-configuration C suite
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          ASSET: ${{ matrix.asset }}
+          EXTENSION: ${{ matrix.extension }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          archive="dist/mimalloc-pprof-${ASSET}.${EXTENSION}"
+          bundle=test-input/release-test-bundle.tar.gz
+          python3 ci/verify_release_test_bundle.py --archive "$archive" --bundle "$bundle" --asset "$ASSET"
+          mkdir -p release-test-bundle
+          tar -C release-test-bundle -xzf "$bundle"
+          python3 ci/run_test_bundle.py release-test-bundle
+
+  preflight-assets:
+    name: Collate and validate exact release archives
+    needs: [build-and-package, build-binaries, test-shipped-assets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: mimalloc-pprof-c-zip
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-binaries-*
+          merge-multiple: true
+          path: dist
+      - name: Name the five archives for the source version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("rust/mimalloc-pprof/Cargo.toml", "rb"))["package"]["version"])')
+          tag="v${version}"
+          mv dist/mimalloc-pprof-c.zip "dist/mimalloc-pprof-c-${tag}.zip"
+          for asset in macos-arm64 macos-x86_64 windows-x64-gnu windows-x64-msvc; do
+            case "$asset" in macos-*) ext=tar.gz ;; *) ext=zip ;; esac
+            mv "dist/mimalloc-pprof-${asset}.${ext}" "dist/mimalloc-pprof-${asset}-${tag}.${ext}"
+          done
+      - name: Record and verify exact archive identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: python3 ci/release.py preflight-artifacts --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" --dist dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-preflight-${{ inputs.candidate_sha }}
+          path: dist/
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release + publish to crates.io
     # build-binaries is a hard dependency, not a best-effort extra: a release that
     # published to crates.io and then shipped three of its four platform archives would be
     # a release nobody can tell is incomplete. `release-outcome` says so out loud too.
-    needs: [build-and-package, build-binaries]
+    needs: [preflight-assets, smoke-shipped-assets]
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: write
       id-token: write
+      issues: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.candidate_sha || github.sha }}
+          ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0 # origin/main is needed to prove a real candidate was merged
+
+      - name: Verify release checkout is the candidate even in a dry run
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" || { echo '::error::release checkout differs from candidate_sha'; exit 1; }
 
       - name: Require exact-SHA full native macOS evidence before any release write
         if: env.IS_DRY_RUN != 'true'
@@ -506,7 +652,7 @@ jobs:
       # during cache restore (issue #55), which skipped the publish job and turned a
       # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
       # retry action, so attempt it twice explicitly.
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
         id: setup_soldr
         continue-on-error: true
         with:
@@ -518,7 +664,7 @@ jobs:
 
       - name: Retry toolchain setup (first attempt failed)
         if: steps.setup_soldr.outcome == 'failure'
-        uses: zackees/setup-soldr@v0
+        uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml
@@ -526,62 +672,24 @@ jobs:
           target-dir: rust/target
           build-cache-mode: full
 
-      - name: Download release ZIP artifact
+      - name: Download archives already tested on native hosts
         uses: actions/download-artifact@v4
         with:
-          name: mimalloc-pprof-c-zip
+          name: release-preflight-${{ inputs.candidate_sha }}
           path: dist
+      - name: Verify the release worker received the exact tested archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: python3 ci/release.py verify-artifacts --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" --dist dist
 
-      - name: Download the cross-built binary assets
-        uses: actions/download-artifact@v4
-        with:
-          # merge-multiple so all four land directly in dist/ rather than in one
-          # subdirectory each -- the rename step and `files:` below both glob dist/.
-          pattern: release-binaries-*
-          merge-multiple: true
-          path: dist
-
-      - name: Determine artifact suffix and release tag
+      - name: Determine release tag
         id: tag
         shell: bash
         run: |
-          if [ "$IS_DRY_RUN" = "true" ]; then
-            # A dry run names its local assets with the exact candidate SHA.
-            # It does not create or name a Git tag.
-            echo "suffix=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          else
-            candidate=$(git rev-parse HEAD)
-            echo "tag=manual-${candidate::7}" >> "$GITHUB_OUTPUT"
-            echo "suffix=manual-${candidate::7}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Rename assets to versioned artifact names, and require all five
-        # Five, counted: the architecture-independent C amalgamation ZIP plus one archive
-        # per cross lane. `needs:` already makes a failed lane fail this job, but an
-        # artifact that uploaded *nothing* under a green step would otherwise reach
-        # softprops/action-gh-release as a silently shorter `files:` list.
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag='${{ steps.tag.outputs.suffix }}'
-          mv dist/mimalloc-pprof-c.zip "dist/mimalloc-pprof-c-${tag}.zip"
-          for asset in macos-arm64 macos-x86_64 windows-x64-gnu windows-x64-msvc; do
-            case "$asset" in macos-*) ext=tar.gz ;; *) ext=zip ;; esac
-            src="dist/mimalloc-pprof-${asset}.${ext}"
-            if [ ! -f "$src" ]; then
-              echo "::error::${src} was not produced by build-binaries; refusing to cut a release missing the ${asset} asset"
-              ls -l dist
-              exit 1
-            fi
-            mv "$src" "dist/mimalloc-pprof-${asset}-${tag}.${ext}"
-          done
-          count=$(ls dist | wc -l)
-          if [ "$count" -ne 5 ]; then
-            echo "::error::expected exactly 5 release assets, found ${count}"
-            ls -l dist
-            exit 1
-          fi
-          ls -l dist
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("rust/mimalloc-pprof/Cargo.toml", "rb"))["package"]["version"])')
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate with crates.io
         if: env.IS_DRY_RUN != 'true'
@@ -643,6 +751,48 @@ jobs:
             dist/mimalloc-pprof-windows-x64-gnu-${{ steps.tag.outputs.tag }}.zip
             dist/mimalloc-pprof-windows-x64-msvc-${{ steps.tag.outputs.tag }}.zip
 
+  # Both dry and real attempts smoke the exact archived library before any release write.
+  smoke-shipped-assets:
+    name: Smoke shipped archive (${{ matrix.asset }})
+    needs: [preflight-assets]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: macos-arm64
+            runner: macos-15
+          - asset: macos-x86_64
+            runner: macos-15-intel
+          - asset: windows-x64-gnu
+            runner: windows-latest
+          - asset: windows-x64-msvc
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download exact worker preflight archive and info.json
+        uses: actions/download-artifact@v4
+        with:
+          name: release-preflight-${{ inputs.candidate_sha }}
+          path: dist
+      - name: Verify checkout and smoke packaged library
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          python3 ci/smoke_release_archive.py --dist dist --asset "$ASSET" --candidate-sha "$CANDIDATE_SHA"
+
   # Issue #55: the publish job is gated on every build job, so a single transient runner
   # failure silently turns a tagged release into a no-op. This job makes that outcome
   # impossible to miss and says exactly how to recover. (The "three OS builds" this comment
@@ -669,3 +819,44 @@ jobs:
           fi
           echo "::error::Candidate ${{ inputs.candidate_sha }} was NOT released (build=${build}, binaries=${binaries}, release=${release}). Check destination state before retrying run ${GITHUB_RUN_ID}."
           exit 1
+
+  record-attempt-outcome:
+    name: Record release attempt outcome on issue
+    needs: [validate-attempt, build-and-package, build-binaries, test-shipped-assets, preflight-assets, smoke-shipped-assets, release]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+      - name: Append run URL and outcome to the release control issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          VALIDATE: ${{ needs.validate-attempt.result }}
+          PACKAGE: ${{ needs.build-and-package.result }}
+          BINARIES: ${{ needs.build-binaries.result }}
+          TEST_SHIPPED: ${{ needs.test-shipped-assets.result }}
+          PREFLIGHT: ${{ needs.preflight-assets.result }}
+          RELEASE: ${{ needs.release.result }}
+          SMOKE: ${{ needs.smoke-shipped-assets.result }}
+          IS_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          state=blocked
+          if [[ "$VALIDATE" == success && "$PACKAGE" == success && "$BINARIES" == success && "$TEST_SHIPPED" == success && "$PREFLIGHT" == success && "$SMOKE" == success && "$RELEASE" == success ]]; then
+            if [[ "$IS_DRY_RUN" == true ]]; then
+              state=dry-passed
+            elif [[ "$IS_DRY_RUN" != true ]]; then
+              state=real-passed
+            fi
+          fi
+          results="validate=$VALIDATE,package=$PACKAGE,binaries=$BINARIES,test-shipped=$TEST_SHIPPED,preflight=$PREFLIGHT,smoke=$SMOKE,release=$RELEASE"
+          python3 ci/release.py record-outcome --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --state "$state" --results "$results"
+          [[ "$state" != blocked ]]
