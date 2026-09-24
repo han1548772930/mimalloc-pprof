@@ -1289,6 +1289,11 @@ pub mod options {
         /// **Fork addition (Bun parity, #338).** Write a heap snapshot at process exit: 0 = off,
         /// 1 = pages, 2 = pages + per-block free maps (`MIMALLOC_SNAPSHOT_PATH` names the file).
         pub const SNAPSHOT_ON_EXIT: Self = Self(sys::mi_option_snapshot_on_exit);
+        /// **Fork addition (#457).** Re-arm an orphaned `subproc->purge_expire` so the
+        /// *deferred* arena purge runs on schedule and [`Opt::PURGE_DELAY`] takes effect.
+        /// Off by default: it returns more free arena memory, but re-faults memory the
+        /// workload is about to reuse.
+        pub const PURGE_REARM: Self = Self(sys::mi_option_purge_rearm);
 
         /// Upstream: milliseconds to delay purging, which the scavenger also honours.
         pub const PURGE_DELAY: Self = Self(sys::mi_option_purge_delay);

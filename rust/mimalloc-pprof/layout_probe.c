@@ -364,7 +364,7 @@ static const mi_rs_layout_entry_t mi_rs_layout_entries[] = {
   MI_RS_OPTION(mi_option_minimal_purge_size)
   MI_RS_OPTION(mi_option_arena_max_object_size)
   MI_RS_OPTION(mi_option_arena_is_numa_local)
-  /* fork additions start here (indices 47..59) */
+  /* fork additions start here (indices 47..60) */
   MI_RS_OPTION(mi_option_prof)
   MI_RS_OPTION(mi_option_prof_sample_rate)
   MI_RS_OPTION(mi_option_prof_bt_max)
@@ -379,6 +379,7 @@ static const mi_rs_layout_entry_t mi_rs_layout_entries[] = {
   MI_RS_OPTION(mi_option_purge_holes_min_interval)
   MI_RS_OPTION(mi_option_purge_holes_full_every)
   MI_RS_OPTION(mi_option_snapshot_on_exit)
+  MI_RS_OPTION(mi_option_purge_rearm)
   MI_RS_OPTION(_mi_option_last)
   /* deprecated aliases, defined after the sentinel with explicit values */
   MI_RS_OPTION(mi_option_large_os_pages)

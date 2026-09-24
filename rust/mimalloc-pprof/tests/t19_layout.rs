@@ -461,7 +461,7 @@ fn versions_and_constants_match_c() {
 }
 
 /// The hazard this whole file exists for: `mi_option_t` is positional, and this fork
-/// inserted thirteen enumerators before `_mi_option_last`. A mirror copied from upstream
+/// inserted fourteen enumerators before `_mi_option_last`. A mirror copied from upstream
 /// would compile, run, and set the wrong option forever.
 #[test]
 fn option_values_match_c() {
