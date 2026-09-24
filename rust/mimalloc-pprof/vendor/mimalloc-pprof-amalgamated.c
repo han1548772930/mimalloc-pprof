@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ff966474 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c7a1fbb7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -699,6 +699,8 @@ typedef enum mi_option_e {
   mi_option_purge_holes_min_interval,   // do not sweep one thread's heaps more often than every N milli-seconds (=100)
   mi_option_purge_holes_full_every,     // every N'th sweep of a thread walks every page, ignoring the per-page skip check (=64); 0 disables
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
+  mi_option_purge_rearm,                // re-arm an orphaned `subproc->purge_expire` so the DEFERRED arena purge runs on schedule and `purge_delay` takes effect (=0, #457).
+                                        // Off by default: with it on the purge actually runs, which returns more free arena memory but measurably costs throughput.
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -13412,7 +13414,56 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       }
     }
     else {
-      // already an expiration was set
+      // Already an expiration was set on THIS arena -- but that does not imply the
+      // subproc-level deadline still is. `subproc->purge_expire` is the only field the
+      // opportunistic path checks (`_mi_arenas_try_purge` returns early while it is 0) and
+      // the only deadline the scavenger waits on, and it is cleared to 0 both by that
+      // function's settle CAS and by the scavenger's own stale-value CAS, while this
+      // arena's expire can stay set. Once the two disagree nothing re-arms the pair, every
+      // opportunistic purge is skipped, and the scavenger parks on its safety net -- so
+      // free arena space is only returned when something forces `mi_collect(true)`, and
+      // `purge_delay` has no effect at all (#457).
+      //
+      // Off by default (`mi_option_purge_rearm`) because making the deferred purge actually
+      // run is not free: it returns more free arena memory but re-faults memory the workload
+      // is about to reuse. Paired A/B (Windows/Release/MSVC, 8 reps, replicated in two
+      // independent sessions) puts the cost at ~1.5-3% throughput, and shows it only on the
+      // SINGLE-THREADED large-block cells (`random-large/1`, `power-of-two-large/1`,
+      // `sparse-large-buffers/1`). The 8-worker cells cannot resolve it -- their CI spans
+      // ~7-25 points and the sign is not reproducible between sessions -- so no figure from
+      // one session there should be quoted. It never moves the peak working set, neither on
+      // `main` nor on top of the compacted spans of #425: the option buys a `purge_delay`
+      // that does what it says, not a smaller footprint.
+      //
+      // The cost is a property of the PURGE MECHANISM, not of this re-arm. `purge_decommits`
+      // defaults to 1, i.e. `VirtualFree(.., MEM_DECOMMIT)` (src/prim/windows/prim.c), so
+      // every range this option successfully returns has to be recommitted and re-zeroed on
+      // reuse -- and per the MEM_RESET documentation decommit is also what puts the pages
+      // back through the paging file. The reset path (`_mi_prim_reset`:
+      // `VirtualAlloc(MEM_RESET)` + `VirtualUnlock`) keeps the range committed, so no
+      // recommit, while `VirtualUnlock` still releases the pages from the process's working
+      // set, so the memory still goes back to the OS. Setting `purge_decommits=0` removes the
+      // measured cost on the two cells where it reproduces -- two sessions, sign flip:
+      // `random-large/1` -1.63/-2.32% -> +0.45/+0.80%, `power-of-two-large/1` -1.95/-1.41%
+      // -> +1.25/+1.04% -- and roughly halves it on the third (`sparse-large-buffers/1`
+      // -1.60/-3.31% -> -0.70/-1.35%). Recommended pairing:
+      //   MIMALLOC_PURGE_REARM=1 MIMALLOC_PURGE_DECOMMITS=0
+      //
+      // When it is off, the stale arena expire is still recorded below, so nothing is lost --
+      // only deferred.
+      if (mi_option_is_enabled(mi_option_purge_rearm)) {
+        // Re-arm from this arena's own pending deadline, which is the value the settle CAS
+        // would have written, so this restores the intended invariant rather than adding a
+        // policy. The CAS keeps an earlier value if one is already there, and the relaxed
+        // pre-check keeps the common case down to a plain load.
+        const mi_msecs_t aexpire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+        if (aexpire != 0 && mi_atomic_loadi64_relaxed(&arena->subproc->purge_expire) == 0) {
+          mi_msecs_t sexp0 = 0;
+          if (mi_atomic_casi64_strong_acq_rel(&arena->subproc->purge_expire, &sexp0, aexpire)) {
+            _mi_scavenger_wake(arena->subproc);
+          }
+        }
+      }
     }
     mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
   }
@@ -21769,6 +21820,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 100,    MI_OPTION_UNINIT, MI_OPTION(purge_holes_min_interval) } // min milli-seconds between two sweeps of the same thread's heaps
   ,{ 64,     MI_OPTION_UNINIT, MI_OPTION(purge_holes_full_every) }   // every N'th sweep walks every page regardless of the skip check; 0 disables (Bun's default)
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) }       // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks. Bun parity (#338)
+  ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(purge_rearm) }            // re-arm an orphaned subproc purge deadline so the deferred arena purge runs on schedule (=0, #457). Costs ~1.5-3% throughput on single-threaded large-block workloads, not on the peak; see src/arena.c for why pairing it with purge_decommits=0 removes that cost.
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
